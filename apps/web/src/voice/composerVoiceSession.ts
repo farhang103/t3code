@@ -6,18 +6,7 @@ import {
   type VoiceInputState,
 } from "@t3tools/client-runtime/voice-input";
 import type { ProviderDriverKind } from "@t3tools/contracts";
-
-/**
- * Framework-free voice dictation session for the web composer.
- *
- * Mirrors the mobile `VoiceInputController` flow (prepare -> record ->
- * transcribe -> guarded commit) but binds to browser primitives
- * (`MediaRecorder`, server transcription) instead of expo-av. The pure
- * commit guard (`resolveTranscriptCommit`) and phase model are reused from
- * `@t3tools/client-runtime/voice-input` so owner/revision/selection
- * semantics stay identical across clients: a late transcript can never
- * overwrite a draft the user kept editing.
- */
+import { formatSpokenPunctuation } from "@t3tools/shared/voicePunctuation";
 
 export type ComposerVoiceDraft = {
   readonly ownerKey: string;
@@ -33,29 +22,31 @@ export type ComposerVoiceCommit = {
   readonly expectedText: string;
 };
 
+export type ComposerVoiceRecorderCallbacks = {
+  readonly onError: (error: Error) => void;
+  readonly onTranscript: (text: string) => void;
+};
+
 export type ComposerVoiceRecorder = {
-  readonly mimeType: string;
-  start(): void;
-  stop(): Promise<Blob>;
+  start(): void | Promise<void>;
+  stop(): Promise<ComposerVoiceTranscript>;
   dispose(): void;
 };
 
-export type ComposerVoiceTranscriber = (
-  audio: Blob,
-  options: { readonly signal: AbortSignal },
-) => Promise<{ readonly text: string; readonly locale: string }>;
+export type ComposerVoiceTranscript = { readonly text: string; readonly locale: string };
 
 export type ComposerVoiceSessionDependencies = {
   readonly readDraft: () => ComposerVoiceDraft | null;
   readonly commitDraft: (commit: ComposerVoiceCommit) => boolean;
-  readonly transcribe: ComposerVoiceTranscriber;
   readonly requestMicrophone: () => Promise<MediaStream>;
   readonly createRecorder: (
-    stream: MediaStream,
-    callbacks: { readonly onError: (error: Error) => void },
+    stream: Promise<MediaStream>,
+    callbacks: ComposerVoiceRecorderCallbacks,
   ) => ComposerVoiceRecorder;
   readonly onStateChange: (state: VoiceInputState) => void;
+  readonly onComplete?: (draft: ComposerVoiceDraft) => void;
   readonly now?: () => number;
+  readonly formatTranscript?: (text: string) => string;
 };
 
 export const IDLE_COMPOSER_VOICE_STATE: VoiceInputState = {
@@ -105,100 +96,12 @@ export function formatVoiceElapsed(totalSeconds: number) {
   return `${Math.floor(clamped / 60)}:${String(clamped % 60).padStart(2, "0")}`;
 }
 
-const PREFERRED_VOICE_MIME_TYPES = [
-  "audio/webm;codecs=opus",
-  "audio/webm",
-  "audio/mp4",
-  "audio/ogg;codecs=opus",
-];
-
-export function pickSupportedVoiceMimeType(): string | undefined {
-  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
-    return undefined;
-  }
-  return PREFERRED_VOICE_MIME_TYPES.find((mime) => MediaRecorder.isTypeSupported(mime));
-}
-
 export function requestComposerMicrophone(): Promise<MediaStream> {
   const mediaDevices = typeof navigator === "undefined" ? undefined : navigator.mediaDevices;
   if (!mediaDevices?.getUserMedia) {
     return Promise.reject(new Error("Voice input is not supported in this browser."));
   }
   return mediaDevices.getUserMedia({ audio: true });
-}
-
-export function createMediaRecorderVoiceRecorder(
-  stream: MediaStream,
-  callbacks?: { readonly onError?: (error: Error) => void },
-): ComposerVoiceRecorder {
-  const mimeType = pickSupportedVoiceMimeType();
-  const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-  const chunks: Blob[] = [];
-  let pendingStop: {
-    resolve: (blob: Blob) => void;
-    reject: (error: unknown) => void;
-  } | null = null;
-
-  const takeAudio = () => new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-  const handleDataAvailable = (event: BlobEvent) => {
-    if (event.data.size > 0) chunks.push(event.data);
-  };
-  const handleStop = () => {
-    const pending = pendingStop;
-    pendingStop = null;
-    pending?.resolve(takeAudio());
-  };
-  const handleError = () => {
-    const failure = new Error("Microphone recording failed.");
-    const pending = pendingStop;
-    pendingStop = null;
-    if (pending) {
-      pending.reject(failure);
-      return;
-    }
-    // No stop() is awaiting (normal recording): the session would otherwise
-    // stay in `recording` forever, blocking send and risking a partial
-    // submit on a later stop.
-    callbacks?.onError?.(failure);
-  };
-  recorder.addEventListener("dataavailable", handleDataAvailable);
-  recorder.addEventListener("stop", handleStop);
-  recorder.addEventListener("error", handleError);
-
-  return {
-    get mimeType() {
-      return recorder.mimeType || "audio/webm";
-    },
-    start() {
-      recorder.start();
-    },
-    stop() {
-      if (recorder.state === "inactive") return Promise.resolve(takeAudio());
-      return new Promise<Blob>((resolve, reject) => {
-        pendingStop = { resolve, reject };
-        recorder.stop();
-      });
-    },
-    dispose() {
-      recorder.removeEventListener("dataavailable", handleDataAvailable);
-      recorder.removeEventListener("stop", handleStop);
-      recorder.removeEventListener("error", handleError);
-      // Settle any awaiting stop() so a cancel/dispose during the
-      // recording->transcribing handoff can't leave finishRecording()
-      // pending forever with `finishing` stuck true.
-      const pending = pendingStop;
-      pendingStop = null;
-      pending?.reject(new Error("Voice recording was cancelled."));
-      if (recorder.state !== "inactive") {
-        try {
-          recorder.stop();
-        } catch {
-          // The recorder already errored or stopped racing us; tracks below
-          // are still released by the session.
-        }
-      }
-    },
-  };
 }
 
 function isPermissionDenied(error: unknown): boolean {
@@ -222,9 +125,13 @@ export class ComposerVoiceSession {
   private revision = 0;
   private lastSeen: { ownerKey: string; text: string } | null = null;
   private capturedDraft: VoiceDraftSnapshot | null = null;
+  private segmentDraft: VoiceDraftSnapshot | null = null;
+  private lastApplied: VoiceDraftSnapshot | null = null;
+  private transcript = "";
+  private segmentOffset = 0;
+  private segmentEnd = 0;
   private stream: MediaStream | null = null;
   private recorder: ComposerVoiceRecorder | null = null;
-  private aborter: AbortController | null = null;
   private startedAt = 0;
   private elapsedSeconds = 0;
   private finishing = false;
@@ -257,16 +164,30 @@ export class ComposerVoiceSession {
       return;
     }
     this.capturedDraft = draft;
+    this.segmentDraft = draft;
+    this.lastApplied = draft;
+    this.transcript = "";
+    this.segmentOffset = 0;
+    this.segmentEnd = draft.selection.end;
     this.elapsedSeconds = 0;
     this.setState({ phase: "preparing", error: null, errorAction: null });
     try {
-      const stream = await this.dependencies.requestMicrophone();
-      if (!this.isCurrent(generation)) {
-        for (const track of stream.getTracks()) track.stop();
-        return;
-      }
-      this.stream = stream;
+      // Negotiate the connection while the browser opens the microphone.
+      const stream = this.dependencies.requestMicrophone().then((capture) => {
+        if (!this.isCurrent(generation)) {
+          for (const track of capture.getTracks()) track.stop();
+          throw new Error("Voice input was cancelled.");
+        }
+        this.stream = capture;
+        return capture;
+      });
+      // A synchronous recorder-construction failure must still release a late mic.
+      void stream.catch(() => {});
       const recorder = this.dependencies.createRecorder(stream, {
+        onTranscript: (text) => {
+          if (!this.isCurrent(generation) || !this.busy) return;
+          this.applyTranscript(text);
+        },
         onError: (recorderError) => {
           if (!this.isCurrent(generation)) return;
           if (this.state.phase !== "recording") return;
@@ -276,17 +197,22 @@ export class ComposerVoiceSession {
         },
       });
       this.recorder = recorder;
-      recorder.start();
+      await Promise.all([recorder.start(), stream]);
+      if (!this.isCurrent(generation)) {
+        recorder.dispose();
+        return;
+      }
       this.startedAt = this.now();
       this.setState({ phase: "recording", error: null, errorAction: null });
     } catch (error) {
       if (!this.isCurrent(generation)) return;
+      this.generation += 1;
       this.cleanupCapture();
       this.capturedDraft = null;
       this.setError(
         isPermissionDenied(error)
           ? "Microphone access was denied."
-          : "Could not access the microphone.",
+          : transcriptionErrorMessage(error),
         "retry",
       );
     }
@@ -353,60 +279,32 @@ export class ComposerVoiceSession {
         if (this.isCurrent(generation)) this.setError("Could not finish voice recording.", "retry");
         return;
       }
-      let audio: Blob;
-      try {
-        audio = await recorder.stop();
-      } catch (error) {
-        // Release the microphone before reporting: a retry overwrites
-        // this.stream, which would orphan the live tracks.
-        this.cleanupCapture();
-        if (this.isCurrent(generation)) this.setError(transcriptionErrorMessage(error), "retry");
-        return;
-      }
-      this.cleanupCapture();
-      if (!this.isCurrent(generation)) return;
-      if (audio.size === 0) {
-        this.setError("No speech was detected.", "retry");
-        return;
-      }
-      const aborter = new AbortController();
-      this.aborter = aborter;
       let transcript: string;
       let locale: string;
       try {
-        ({ text: transcript, locale } = await this.dependencies.transcribe(audio, {
-          signal: aborter.signal,
-        }));
+        ({ text: transcript, locale } = await recorder.stop());
       } catch (error) {
-        if (this.isCurrent(generation)) this.setError(transcriptionErrorMessage(error), "retry");
+        if (this.isCurrent(generation)) {
+          this.cleanupCapture();
+          this.setError(transcriptionErrorMessage(error), "retry");
+        }
         return;
-      } finally {
-        if (this.aborter === aborter) this.aborter = null;
       }
       if (!this.isCurrent(generation)) return;
-      const result = resolveTranscriptCommit(
-        captured,
-        this.readRevisionedDraft(),
-        transcript,
-        locale,
-      );
-      if (result.kind === "stale") {
+      this.cleanupCapture();
+      if (this.readRevisionedDraft()?.ownerKey !== captured.ownerKey) {
         this.setError(
           "The draft changed while voice input was running. The transcript was not added.",
           "retry",
         );
         return;
       }
-      if (result.kind === "empty") {
+      if (!transcript.trim()) {
         this.setError("No speech was detected.", "retry");
         return;
       }
-      const applied = this.dependencies.commitDraft({
-        rangeStart: captured.selection.start,
-        rangeEnd: captured.selection.end,
-        insertion: result.text.slice(captured.selection.start, result.selection.start),
-        expectedText: captured.text.slice(captured.selection.start, captured.selection.end),
-      });
+      const hasFinalWords = transcript !== this.transcript;
+      const applied = this.applyTranscript(transcript, locale);
       if (!this.isCurrent(generation)) return;
       if (!applied) {
         this.setError(
@@ -415,14 +313,82 @@ export class ComposerVoiceSession {
         );
         return;
       }
+      // The editor may not have rendered the final commit yet. Use its expected
+      // snapshot for new words, but preserve typing since an earlier live chunk.
+      const completed = hasFinalWords ? this.lastApplied : this.readRevisionedDraft();
       this.elapsedSeconds = 0;
       this.setState(IDLE_COMPOSER_VOICE_STATE);
+      if (completed?.text.trim()) {
+        this.dependencies.onComplete?.({
+          ownerKey: completed.ownerKey,
+          text: completed.text,
+          selectionStart: 0,
+          selectionEnd: completed.text.length,
+        });
+      }
     } finally {
       // A cancel/dispose bumps generation and already cleared the gate; only
       // clear here when still current so a stale finish can't unblock (or
       // re-block) a fresh session's stop().
       if (this.generation === generation) this.finishing = false;
     }
+  }
+
+  /** Update only our current insertion; moving or editing starts a new one. */
+  private applyTranscript(text: string, locale = "en"): boolean {
+    const current = this.readRevisionedDraft();
+    if (!current || current.ownerKey !== this.capturedDraft?.ownerKey) return false;
+    if (text === this.transcript) return true;
+    // Realtime input chunks are cumulative. Never replay old speech after edits.
+    if (!text.startsWith(this.transcript)) return false;
+    const previous = this.lastApplied;
+    const moved =
+      !previous ||
+      current.text !== previous.text ||
+      current.selection.start !== previous.selection.start ||
+      current.selection.end !== previous.selection.end;
+    if (moved) {
+      this.segmentDraft = current;
+      this.segmentOffset = this.transcript.length;
+      this.segmentEnd = current.selection.end;
+    }
+    const base = this.segmentDraft;
+    if (!base) return false;
+    const formatted = (this.dependencies.formatTranscript ?? formatSpokenPunctuation)(
+      text.slice(this.segmentOffset).trim(),
+    );
+    const result = resolveTranscriptCommit(base, base, formatted, locale, {
+      preserveWhitespace: true,
+    });
+    if (result.kind === "stale") return false;
+    if (result.kind === "empty" && current.text === base.text) {
+      this.transcript = text;
+      this.lastApplied = current;
+      return true;
+    }
+    const end = this.segmentEnd;
+    const insertion =
+      result.kind === "empty"
+        ? base.text.slice(base.selection.start, base.selection.end)
+        : result.text.slice(base.selection.start, result.selection.start);
+    const applied = this.dependencies.commitDraft({
+      rangeStart: base.selection.start,
+      rangeEnd: end,
+      insertion,
+      expectedText: current.text.slice(base.selection.start, end),
+    });
+    if (!applied) return false;
+    this.transcript = text;
+    this.segmentEnd = base.selection.start + insertion.length;
+    this.lastApplied =
+      result.kind === "empty"
+        ? {
+            ...current,
+            text: base.text,
+            selection: { start: this.segmentEnd, end: this.segmentEnd },
+          }
+        : { ...current, text: result.text, selection: result.selection };
+    return true;
   }
 
   private readRevisionedDraft(): VoiceDraftSnapshot | null {
@@ -455,8 +421,6 @@ export class ComposerVoiceSession {
   }
 
   private cleanupCapture(): void {
-    this.aborter?.abort();
-    this.aborter = null;
     try {
       this.recorder?.dispose();
     } catch {

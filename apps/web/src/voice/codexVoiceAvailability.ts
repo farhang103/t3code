@@ -1,57 +1,55 @@
-import * as Effect from "effect/Effect";
-import { useEffect, useState } from "react";
+import type { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import { voiceAvailability } from "@t3tools/client-runtime/voice-input";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { runtime } from "../lib/runtime";
+import { usePreparedConnection } from "../state/session";
 
-import { PrimaryEnvironmentHttpClient } from "../environments/primary/httpClient";
-import { runPrimaryHttp } from "../lib/runtime";
-
-/**
- * Server-reported Codex voice availability (`GET /api/voice/availability`).
- *
- * Stale-while-revalidate across composer remounts (the mic remounts per
- * thread): the first mount in the session fetches, later mounts render the
- * cached value instantly and refresh in the background. Failures resolve to
- * `false` so the mic fails closed instead of inviting a doomed recording.
- */
-
-let cachedVoiceAvailability: boolean | null = null;
-let inFlightVoiceAvailability: Promise<boolean> | null = null;
-
-function fetchVoiceAvailability(): Promise<boolean> {
-  if (!inFlightVoiceAvailability) {
-    inFlightVoiceAvailability = runPrimaryHttp(
-      PrimaryEnvironmentHttpClient.pipe(
-        Effect.flatMap((client) => client.voice.availability({ headers: {} })),
-        Effect.map((result) => result.codexVoiceAvailable),
-      ),
-    ).then(
-      (available) => {
-        cachedVoiceAvailability = available;
-        inFlightVoiceAvailability = null;
-        return available;
-      },
-      () => {
-        cachedVoiceAvailability = false;
-        inFlightVoiceAvailability = null;
-        return false;
-      },
-    );
-  }
-  return inFlightVoiceAvailability;
-}
-
-export function useCodexVoiceAvailability(): boolean | null {
-  const [available, setAvailable] = useState<boolean | null>(cachedVoiceAvailability);
+export function useCodexVoiceAvailability(
+  environmentId: EnvironmentId,
+  instanceId: ProviderInstanceId,
+  enabled: boolean,
+) {
+  const connection = usePreparedConnection(environmentId);
+  const prepared = connection._tag === "Some" ? connection.value : null;
+  const lastWarm = useRef(0);
+  const warmRef = useRef(() => {});
+  const key = `${environmentId}:${instanceId}`;
+  const [result, setResult] = useState<{ key: string; available: boolean } | null>(null);
   useEffect(() => {
-    if (cachedVoiceAvailability !== null) {
-      setAvailable(cachedVoiceAvailability);
-    }
-    let cancelled = false;
-    void fetchVoiceAvailability().then((next) => {
-      if (!cancelled) setAvailable(next);
-    });
-    return () => {
-      cancelled = true;
+    if (!enabled) return;
+    if (!prepared) return;
+    lastWarm.current = 0;
+    const aborter = new AbortController();
+    const warm = () => {
+      if (document.visibilityState === "hidden" || Date.now() - lastWarm.current < 15_000) return;
+      lastWarm.current = Date.now();
+      void runtime
+        .runPromise(voiceAvailability(prepared, instanceId), { signal: aborter.signal })
+        .then(
+          (response) => {
+            if (!aborter.signal.aborted)
+              setResult({ key, available: response.codexVoiceAvailable });
+          },
+          () => {
+            if (!aborter.signal.aborted) setResult({ key, available: false });
+          },
+        );
     };
+    warmRef.current = warm;
+    warm();
+    // Returning after the server's idle warm slot expires should start preparing
+    // before the user clicks the mic, without keeping a CLI alive in the background.
+    window.addEventListener("focus", warm);
+    document.addEventListener("visibilitychange", warm);
+    return () => {
+      aborter.abort();
+      warmRef.current = () => {};
+      window.removeEventListener("focus", warm);
+      document.removeEventListener("visibilitychange", warm);
+    };
+  }, [key, prepared, instanceId, enabled]);
+  const prepare = useCallback(() => {
+    warmRef.current();
   }, []);
-  return available;
+  return { available: !enabled ? false : result?.key === key ? result.available : null, prepare };
 }

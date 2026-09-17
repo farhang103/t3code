@@ -2,25 +2,27 @@ import {
   voiceInputBlocksSubmission,
   type VoiceInputState,
 } from "@t3tools/client-runtime/voice-input";
-import type { ProviderDriverKind } from "@t3tools/contracts";
+import type { EnvironmentId, ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
 import { MicIcon, SquareIcon, XIcon } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createDictationFormatter } from "@t3tools/shared/voicePunctuation";
+import { useEnvironmentSettings } from "../../hooks/useSettings";
 
+import { ComposerVoicePolish } from "./ComposerVoicePolish";
+import { VoiceWaveform } from "./VoiceWaveform";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { createCodexVoiceTranscriber } from "../../voice/codexVoiceTranscriber";
+import { createCodexVoiceRecorder } from "../../voice/codexVoiceRecorder";
 import { useCodexVoiceAvailability } from "../../voice/codexVoiceAvailability";
 import {
   ComposerVoiceSession,
-  createMediaRecorderVoiceRecorder,
   formatVoiceElapsed,
   IDLE_COMPOSER_VOICE_STATE,
   requestComposerMicrophone,
   resolveVoiceMicAvailability,
   type ComposerVoiceCommit,
   type ComposerVoiceDraft,
-  type ComposerVoiceTranscriber,
 } from "../../voice/composerVoiceSession";
 
 // TODO(composer.dictate): bind `composer.dictate` (default mod+shift+D) to
@@ -29,32 +31,37 @@ import {
 // validation against servers that do not know the command yet. The mic button
 // below is the supported entry point until then.
 
-// Static levels keep the recording affordance cheap: no timers, meters, or
-// animations repaint while recording (timer text updates at 2 Hz only).
-const VOICE_WAVEFORM_BARS = [9, 15, 21, 12, 24, 17, 10, 19, 13, 22, 11, 16];
-
 export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
   readonly driverKind: ProviderDriverKind;
   readonly composerDisabled: boolean;
   readonly readDraft: () => ComposerVoiceDraft | null;
   readonly commitDraft: (commit: ComposerVoiceCommit) => boolean;
-  readonly transcribe?: ComposerVoiceTranscriber;
+  readonly instanceId: ProviderInstanceId;
+  readonly environmentId: EnvironmentId;
+  readonly focusDraft: () => void;
   readonly onBusyChange?: (busy: boolean) => void;
 }) {
   const [voiceState, setVoiceState] = useState<VoiceInputState>(IDLE_COMPOSER_VOICE_STATE);
+  const [completedDraft, setCompletedDraft] = useState<ComposerVoiceDraft | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [captureStream, setCaptureStream] = useState<MediaStream | null>(null);
+  const dictation = useEnvironmentSettings(props.environmentId, (settings) => settings.dictation);
+  const formatTranscript = useMemo(() => createDictationFormatter(dictation), [dictation]);
 
-  const latestRef = useRef({ readDraft: props.readDraft, commitDraft: props.commitDraft });
-  latestRef.current = { readDraft: props.readDraft, commitDraft: props.commitDraft };
+  const latestRef = useRef({
+    readDraft: props.readDraft,
+    commitDraft: props.commitDraft,
+    formatTranscript,
+  });
   const busyRef = useRef(props.onBusyChange);
-  busyRef.current = props.onBusyChange;
-
-  const transcriber = useMemo(
-    () => props.transcribe ?? createCodexVoiceTranscriber(),
-    [props.transcribe],
-  );
-  const transcriberRef = useRef(transcriber);
-  transcriberRef.current = transcriber;
+  useLayoutEffect(() => {
+    latestRef.current = {
+      readDraft: props.readDraft,
+      commitDraft: props.commitDraft,
+      formatTranscript,
+    };
+    busyRef.current = props.onBusyChange;
+  });
 
   const sessionRef = useRef<ComposerVoiceSession | null>(null);
   useEffect(() => {
@@ -65,11 +72,25 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
     const session = new ComposerVoiceSession({
       readDraft: () => latestRef.current.readDraft(),
       commitDraft: (commit) => latestRef.current.commitDraft(commit),
-      transcribe: (audio, options) => transcriberRef.current(audio, options),
-      requestMicrophone: requestComposerMicrophone,
-      createRecorder: createMediaRecorderVoiceRecorder,
+      formatTranscript: (text) => latestRef.current.formatTranscript(text),
+      requestMicrophone: async () => {
+        const stream = await requestComposerMicrophone();
+        if (sessionRef.current === session && session.busy) setCaptureStream(stream);
+        return stream;
+      },
+      createRecorder: (stream, callbacks) => {
+        const recorder = createCodexVoiceRecorder(
+          props.environmentId,
+          props.instanceId,
+          stream,
+          callbacks,
+        );
+        return recorder;
+      },
+      onComplete: setCompletedDraft,
       onStateChange: (next) => {
         setVoiceState(next);
+        if (next.phase !== "recording" && next.phase !== "preparing") setCaptureStream(null);
         busyRef.current?.(voiceInputBlocksSubmission(next));
       },
     });
@@ -82,7 +103,7 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
       // otherwise a target switch mid-recording leaves Send disabled forever.
       busyRef.current?.(false);
     };
-  }, []);
+  }, [props.environmentId, props.instanceId]);
 
   useEffect(() => {
     if (voiceState.phase !== "recording") return;
@@ -96,10 +117,14 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
   }, [voiceState.phase]);
 
   const busy = voiceInputBlocksSubmission(voiceState);
-  // Authoritative availability comes from GET /api/voice/availability;
+  // Authoritative availability comes from POST /api/voice/availability;
   // the driver gate keeps the mic visible-but-disabled ("coming soon") for
   // every non-Codex provider.
-  const serverVoiceAvailable = useCodexVoiceAvailability();
+  const { available: serverVoiceAvailable, prepare: prepareVoice } = useCodexVoiceAvailability(
+    props.environmentId,
+    props.instanceId,
+    props.driverKind === "codex",
+  );
   const availability = resolveVoiceMicAvailability({
     driverKind: props.driverKind,
     codexVoiceAvailable: serverVoiceAvailable === true,
@@ -108,124 +133,21 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
   const availabilityLoading = props.driverKind === "codex" && serverVoiceAvailable === null;
 
   const handleStart = () => {
+    setCompletedDraft(null);
     setElapsedSeconds(0);
+    props.focusDraft();
+    prepareVoice();
     void sessionRef.current?.start();
   };
 
-  if (!busy && voiceState.phase !== "error") {
-    const startTooltip = availabilityLoading
-      ? "Checking voice input availability…"
-      : availability.available
-        ? "Dictate"
-        : availability.reason;
-    return (
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            availability.available ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                onPointerDown={(event) => event.preventDefault()}
-                onClick={handleStart}
-                aria-label="Dictate"
-                data-chat-composer-voice="idle"
-              />
-            ) : (
-              <span className="inline-flex shrink-0">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  disabled
-                  aria-label={startTooltip}
-                  data-chat-composer-voice="unavailable"
-                />
-              </span>
-            )
-          }
-        >
-          <MicIcon className="size-4" />
-        </TooltipTrigger>
-        <TooltipPopup side="top">{startTooltip}</TooltipPopup>
-      </Tooltip>
-    );
-  }
-
-  return (
-    <div
-      className="relative flex shrink-0 items-center"
-      data-chat-composer-voice={voiceState.phase}
-    >
-      {voiceState.phase === "error" ? (
-        <div
-          role="alert"
-          className="absolute right-0 bottom-full z-10 mb-2 w-64 rounded-md border bg-popover p-2 text-popover-foreground shadow-md"
-        >
-          <p className="text-xs">{voiceState.error ?? "Voice input failed."}</p>
-          <div className="mt-1.5 flex justify-end">
-            <Button
-              type="button"
-              variant="ghost"
-              size="micro"
-              onClick={() => sessionRef.current?.dismissError()}
-            >
-              Dismiss
-            </Button>
-          </div>
-        </div>
-      ) : null}
-      {voiceState.phase === "recording" ? (
-        <>
-          <span aria-hidden="true" className="flex items-center gap-[2px] text-current opacity-40">
-            {VOICE_WAVEFORM_BARS.map((height) => (
-              <span key={height} className="w-[2.5px] rounded-full bg-current" style={{ height }} />
-            ))}
-          </span>
-          <span
-            aria-hidden="true"
-            className="ms-1.5 min-w-9 text-xs text-muted-foreground tabular-nums"
-          >
-            {formatVoiceElapsed(elapsedSeconds)}
-          </span>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => sessionRef.current?.cancel()}
-                  aria-label="Cancel dictation"
-                />
-              }
-            >
-              <XIcon className="size-4" />
-            </TooltipTrigger>
-            <TooltipPopup side="top">Cancel dictation</TooltipPopup>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="icon-sm"
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => void sessionRef.current?.stop()}
-                  aria-label="Stop recording and transcribe"
-                  aria-pressed="true"
-                />
-              }
-            >
-              <SquareIcon className="size-3.5 fill-current" />
-            </TooltipTrigger>
-            <TooltipPopup side="top">Stop recording and transcribe</TooltipPopup>
-          </Tooltip>
-        </>
-      ) : voiceState.phase === "error" ? (
+  const renderInput = () => {
+    if (!busy && voiceState.phase !== "error") {
+      const startTooltip = availabilityLoading
+        ? "Checking voice input availability…"
+        : availability.available
+          ? "Dictate with Codex - keeps recording in the background"
+          : availability.reason;
+      return (
         <Tooltip>
           <TooltipTrigger
             render={
@@ -236,7 +158,10 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
                   size="icon-sm"
                   onPointerDown={(event) => event.preventDefault()}
                   onClick={handleStart}
-                  aria-label="Retry dictation"
+                  onPointerEnter={prepareVoice}
+                  onFocus={prepareVoice}
+                  aria-label="Dictate"
+                  data-chat-composer-voice="idle"
                 />
               ) : (
                 <span className="inline-flex shrink-0">
@@ -245,7 +170,8 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
                     variant="ghost"
                     size="icon-sm"
                     disabled
-                    aria-label={availability.reason}
+                    aria-label={startTooltip}
+                    data-chat-composer-voice="unavailable"
                   />
                 </span>
               )
@@ -253,44 +179,149 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
           >
             <MicIcon className="size-4" />
           </TooltipTrigger>
-          <TooltipPopup side="top">
-            {availability.available ? "Retry dictation" : availability.reason}
-          </TooltipPopup>
+          <TooltipPopup side="top">{startTooltip}</TooltipPopup>
         </Tooltip>
-      ) : (
-        <>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            disabled
-            aria-label={
-              voiceState.phase === "preparing" ? "Starting voice input" : "Transcribing voice input"
-            }
+      );
+    }
+
+    return (
+      <div
+        className={
+          busy
+            ? "relative flex min-w-0 flex-1 items-center gap-3"
+            : "relative flex shrink-0 items-center"
+        }
+        data-chat-composer-voice={voiceState.phase}
+      >
+        {voiceState.phase === "error" ? (
+          <div
+            role="alert"
+            className="absolute right-0 bottom-full z-10 mb-2 w-64 rounded-md border bg-popover p-2 text-popover-foreground shadow-md"
           >
-            <Spinner className="size-4" aria-hidden="true" />
-          </Button>
-          <span className="sr-only" role="status">
-            {voiceState.phase === "preparing" ? "Starting voice input" : "Transcribing voice input"}
-          </span>
+            <p className="text-xs">{voiceState.error ?? "Voice input failed."}</p>
+            <div className="mt-1.5 flex justify-end">
+              <Button
+                type="button"
+                variant="ghost"
+                size="micro"
+                onClick={() => sessionRef.current?.dismissError()}
+              >
+                Dismiss
+              </Button>
+            </div>
+          </div>
+        ) : null}
+        {voiceState.phase === "recording" ? (
+          <>
+            <Button
+              type="button"
+              variant="secondary"
+              size="icon-sm"
+              className="shrink-0 rounded-full"
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={() => sessionRef.current?.cancel()}
+              aria-label="Cancel dictation and keep inserted text"
+              title="Cancel dictation and keep inserted text"
+            >
+              <XIcon className="size-4" />
+            </Button>
+            <VoiceWaveform stream={captureStream} />
+            <span
+              className="shrink-0 text-xs text-muted-foreground tabular-nums"
+              aria-label="Recording time"
+            >
+              {formatVoiceElapsed(elapsedSeconds)}
+            </span>
+            <Button
+              type="button"
+              variant="default"
+              size="icon-sm"
+              className="shrink-0 rounded-full"
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={() => void sessionRef.current?.stop()}
+              aria-label="Stop dictation"
+              title="Stop dictation"
+            >
+              <SquareIcon className="size-3.5 fill-current" />
+            </Button>
+            <span className="sr-only" role="status">
+              Recording. Continues in the background for up to five minutes. Stop or cancel at any
+              time.
+            </span>
+          </>
+        ) : voiceState.phase === "error" ? (
           <Tooltip>
             <TooltipTrigger
               render={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => sessionRef.current?.cancel()}
-                  aria-label="Cancel voice input"
-                />
+                availability.available ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    onPointerDown={(event) => event.preventDefault()}
+                    onClick={handleStart}
+                    aria-label="Retry dictation"
+                  />
+                ) : (
+                  <span className="inline-flex shrink-0">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled
+                      aria-label={availability.reason}
+                    />
+                  </span>
+                )
               }
             >
-              <XIcon className="size-4" />
+              <MicIcon className="size-4" />
             </TooltipTrigger>
-            <TooltipPopup side="top">Cancel voice input</TooltipPopup>
+            <TooltipPopup side="top">
+              {availability.available ? "Retry dictation" : availability.reason}
+            </TooltipPopup>
           </Tooltip>
-        </>
+        ) : (
+          <>
+            <Button
+              type="button"
+              variant="secondary"
+              size="icon-sm"
+              className="shrink-0 rounded-full"
+              onPointerDown={(event) => event.preventDefault()}
+              onClick={() => sessionRef.current?.cancel()}
+              aria-label="Cancel voice input"
+              title="Cancel voice input"
+            >
+              <XIcon className="size-4" />
+            </Button>
+            <span
+              className="flex min-w-0 flex-1 items-center justify-center gap-2 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Spinner className="size-4" aria-hidden="true" />
+              {voiceState.phase === "preparing"
+                ? "Connecting microphone…"
+                : "Finishing last words…"}
+            </span>
+          </>
+        )}
+      </div>
+    );
+  };
+  return (
+    <div className={`flex min-w-0 items-center ${busy ? "flex-1 gap-1" : "shrink-0"}`}>
+      {renderInput()}
+      {props.driverKind === "codex" && (
+        <ComposerVoicePolish
+          environmentId={props.environmentId}
+          instanceId={props.instanceId}
+          disabled={props.composerDisabled}
+          busy={busy}
+          completedDraft={completedDraft}
+          readDraft={props.readDraft}
+          commitDraft={props.commitDraft}
+        />
       )}
     </div>
   );

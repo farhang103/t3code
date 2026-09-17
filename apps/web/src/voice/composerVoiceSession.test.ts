@@ -2,7 +2,8 @@ import {
   VOICE_RECORDING_LIMIT_SECONDS,
   voiceInputBlocksSubmission,
 } from "@t3tools/client-runtime/voice-input";
-import { ProviderDriverKind } from "@t3tools/contracts";
+import { createDictationFormatter } from "@t3tools/shared/voicePunctuation";
+import { DEFAULT_DICTATION_SETTINGS, ProviderDriverKind } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -12,8 +13,9 @@ import {
   resolveVoiceSendDisabledReason,
   VOICE_BUSY_SEND_DISABLED_REASON,
   type ComposerVoiceCommit,
+  type ComposerVoiceDraft,
   type ComposerVoiceRecorder,
-  type ComposerVoiceSessionDependencies,
+  type ComposerVoiceTranscript,
 } from "./composerVoiceSession";
 
 type Transcript = { text: string; locale: string };
@@ -34,18 +36,25 @@ function applyCommit(draft: DraftHarness, commit: ComposerVoiceCommit): boolean 
   if (draft.text.slice(commit.rangeStart, commit.rangeEnd) !== commit.expectedText) return false;
   draft.text =
     draft.text.slice(0, commit.rangeStart) + commit.insertion + draft.text.slice(commit.rangeEnd);
+  draft.selectionStart = commit.rangeStart + commit.insertion.length;
+  draft.selectionEnd = draft.selectionStart;
   draft.commits.push(commit);
   return true;
 }
 
 class FakeRecorder implements ComposerVoiceRecorder {
-  readonly mimeType = "audio/webm";
+  transcribe: (audio: Blob, options: { signal: AbortSignal }) => Promise<ComposerVoiceTranscript> =
+    async () => {
+      throw new Error("transcriber not stubbed");
+    };
+  aborter = new AbortController();
   started = false;
   stopped = false;
   disposed = false;
   failStop = false;
   useDeferredStop = false;
   audio = new Blob(["audio-bytes"], { type: "audio/webm" });
+  onTranscript: ((text: string) => void) | null = null;
   onError: ((error: Error) => void) | null = null;
   private deferredStop: {
     promise: Promise<Blob>;
@@ -57,7 +66,13 @@ class FakeRecorder implements ComposerVoiceRecorder {
     this.started = true;
   }
 
-  stop(): Promise<Blob> {
+  async stop(): Promise<ComposerVoiceTranscript> {
+    const audio = await this.stopAudio();
+    if (!audio.size) return { text: "", locale: "en" };
+    return this.transcribe(audio, { signal: this.aborter.signal });
+  }
+
+  stopAudio(): Promise<Blob> {
     this.stopped = true;
     if (this.failStop) return Promise.reject(new Error("stop failed"));
     if (this.useDeferredStop) {
@@ -86,6 +101,7 @@ class FakeRecorder implements ComposerVoiceRecorder {
 
   dispose(): void {
     this.disposed = true;
+    this.aborter.abort();
     // Mirror createMediaRecorderVoiceRecorder: settling a pending stop() so
     // finishRecording() can't hang with `finishing` stuck true.
     const pending = this.deferredStop;
@@ -129,12 +145,15 @@ function flushAsync(): Promise<void> {
 
 function createSession(input: {
   draft: DraftHarness;
-  transcribe?: ComposerVoiceSessionDependencies["transcribe"];
+  transcribe?: FakeRecorder["transcribe"];
   requestMicrophone?: () => Promise<MediaStream>;
   now?: () => number;
+  formatTranscript?: (text: string) => string;
 }) {
   const phases: string[] = [];
+  const completions: ComposerVoiceDraft[] = [];
   const recorder = new FakeRecorder();
+  if (input.transcribe) recorder.transcribe = input.transcribe;
   const stoppedTracks: string[] = [];
   const stream = {
     getTracks: () => [{ stop: () => stoppedTracks.push("track") }],
@@ -148,11 +167,6 @@ function createSession(input: {
       selectionEnd: input.draft.selectionEnd,
     }),
     commitDraft: (commit) => applyCommit(input.draft, commit),
-    transcribe:
-      input.transcribe ??
-      (async () => {
-        throw new Error("transcriber not stubbed");
-      }),
     requestMicrophone:
       input.requestMicrophone ??
       (async () => {
@@ -161,18 +175,25 @@ function createSession(input: {
       }),
     createRecorder: (_stream, callbacks) => {
       recorder.onError = callbacks.onError;
+      recorder.onTranscript = callbacks.onTranscript;
       return recorder;
+    },
+    onComplete: (draft) => {
+      expect(session.busy).toBe(false);
+      completions.push(draft);
     },
     onStateChange: (state) => {
       phases.push(state.phase);
     },
     now: input.now ?? Date.now,
+    ...(input.formatTranscript ? { formatTranscript: input.formatTranscript } : {}),
   });
   return {
     session,
     recorder,
     phases,
     stoppedTracks,
+    completions,
     microphoneCalls: () => microphoneCalls,
   };
 }
@@ -231,20 +252,18 @@ describe("ComposerVoiceSession transcript commit", () => {
 });
 
 describe("ComposerVoiceSession draft guards", () => {
-  it("drops a late transcript when the draft text changed mid-recording", async () => {
+  it("inserts at the current caret after typing during recording", async () => {
     const draft = createDraft("hello", 5);
     const { transcribe, pending } = createDeferredTranscriber();
     const { session } = createSession({ draft, transcribe });
 
     await session.start();
     draft.text = "hello edited";
+    draft.selectionStart = draft.selectionEnd = draft.text.length;
     await stopAndResolve(session, pending, { text: "late words", locale: "en" });
 
-    expect(draft.commits).toHaveLength(0);
-    expect(draft.text).toBe("hello edited");
-    expect(session.currentState.phase).toBe("error");
-    expect(session.currentState.error).toContain("draft changed");
-    session.dismissError();
+    expect(draft.commits).toHaveLength(1);
+    expect(draft.text).toBe("hello edited late words");
     expect(session.currentState.phase).toBe("idle");
   });
 
@@ -300,9 +319,12 @@ describe("ComposerVoiceSession lifecycle", () => {
     const session = new ComposerVoiceSession({
       readDraft: () => ({ ...draft, selectionStart: 5, selectionEnd: 5 }),
       commitDraft: (commit) => applyCommit(draft, commit),
-      transcribe,
       requestMicrophone: async () => ({ getTracks: () => [] }) as unknown as MediaStream,
-      createRecorder: () => new FakeRecorder(),
+      createRecorder: () => {
+        const recorder = new FakeRecorder();
+        recorder.transcribe = transcribe;
+        return recorder;
+      },
       onStateChange: (state) => {
         seen.push(state.phase);
         expect(voiceInputBlocksSubmission(state)).toBe(state.phase !== "idle");
@@ -510,5 +532,179 @@ describe("composer voice send and mic gating", () => {
     expect(formatVoiceElapsed(7)).toBe("0:07");
     expect(formatVoiceElapsed(65)).toBe("1:05");
     expect(formatVoiceElapsed(300)).toBe("5:00");
+  });
+});
+
+describe("editable live dictation", () => {
+  it("inserts live words once and follows the caret when it moves", async () => {
+    const draft = createDraft("hello", 5);
+    const { transcribe, pending } = createDeferredTranscriber();
+    const { session, recorder } = createSession({ draft, transcribe });
+    await session.start();
+    recorder.onTranscript?.("wonderful");
+    recorder.onTranscript?.("wonderful world");
+    expect(draft.text).toBe("hello wonderful world");
+    draft.selectionStart = draft.selectionEnd = 0;
+    recorder.onTranscript?.("wonderful world first");
+    expect(draft.text).toBe("first hello wonderful world");
+    await stopAndResolve(session, pending, { text: "wonderful world first", locale: "en" });
+    expect(draft.text).toBe("first hello wonderful world");
+    expect(draft.selectionStart).toBe(6);
+  });
+
+  it("preserves typed corrections and replaces a new selection", async () => {
+    const draft = createDraft("", 0);
+    const { transcribe, pending } = createDeferredTranscriber();
+    const { session, recorder } = createSession({ draft, transcribe });
+    await session.start();
+    recorder.onTranscript?.("hello world");
+    draft.text = "Hello world!";
+    draft.selectionStart = 6;
+    draft.selectionEnd = 11;
+    recorder.onTranscript?.("hello world everyone");
+    expect(draft.text).toBe("Hello everyone!");
+    await stopAndResolve(session, pending, { text: "hello world everyone", locale: "en" });
+    expect(draft.text).toBe("Hello everyone!");
+  });
+
+  it("handles spoken punctuation split across chunks without duplication", async () => {
+    const draft = createDraft("", 0);
+    const { transcribe, pending } = createDeferredTranscriber();
+    const { session, recorder } = createSession({ draft, transcribe });
+    await session.start();
+    recorder.onTranscript?.("is it ready question");
+    recorder.onTranscript?.("is it ready question mark");
+    expect(draft.text).toBe("is it ready?");
+    recorder.onTranscript?.("is it ready question mark yes comma it is period");
+    expect(draft.text).toBe("is it ready? yes, it is.");
+    await stopAndResolve(session, pending, {
+      text: "is it ready question mark yes comma it is period",
+      locale: "en",
+    });
+    expect(draft.text).toBe("is it ready? yes, it is.");
+  });
+
+  it("keeps edits made while waiting for the last words", async () => {
+    const draft = createDraft("", 0);
+    const { transcribe, pending } = createDeferredTranscriber();
+    const { session, recorder } = createSession({ draft, transcribe });
+    await session.start();
+    recorder.onTranscript?.("check it");
+    const stopped = session.stop();
+    await flushAsync();
+    draft.text = "Please check it";
+    draft.selectionStart = draft.selectionEnd = draft.text.length;
+    pending[0]?.resolve({ text: "check it again", locale: "en" });
+    await stopped;
+    expect(draft.text).toBe("Please check it again");
+    expect(session.currentState.phase).toBe("idle");
+  });
+
+  it("keeps visible text on cancel and ignores old chunks after restarting", async () => {
+    const draft = createDraft("keep this", 9);
+    const { session, recorder } = createSession({ draft });
+    await session.start();
+    const oldTranscript = recorder.onTranscript;
+    oldTranscript?.("and this");
+    session.cancel();
+    expect(draft.text).toBe("keep this and this");
+    oldTranscript?.("late cancelled chunk");
+    await session.start();
+    recorder.onTranscript?.("new recording");
+    oldTranscript?.("late old recording");
+    expect(draft.text).toBe("keep this and this new recording");
+    session.dispose();
+  });
+});
+
+describe("live formatting commands", () => {
+  it("preserves whitespace inside saved snippets", async () => {
+    const draft = createDraft("", 0);
+    const { session, recorder } = createSession({
+      draft,
+      formatTranscript: createDictationFormatter({
+        ...DEFAULT_DICTATION_SETTINGS,
+        replacements: [{ kind: "snippet", phrase: "my code", replacement: "  run();\n" }],
+      }),
+    });
+    await session.start();
+    recorder.onTranscript?.("my code");
+    expect(draft.text).toBe("  run();\n");
+    session.dispose();
+  });
+  it("keeps paragraph breaks and supports undoing a dictated insertion", async () => {
+    const draft = createDraft("typed text", 10);
+    const { session, recorder } = createSession({
+      draft,
+      formatTranscript: createDictationFormatter(DEFAULT_DICTATION_SETTINGS),
+    });
+    await session.start();
+    recorder.onTranscript?.("new paragraph");
+    expect(draft.text).toBe("typed text\n\n");
+    recorder.onTranscript?.("new paragraph mistaken words");
+    expect(draft.text).toBe("typed text\n\nmistaken words");
+    recorder.onTranscript?.("new paragraph mistaken words scratch that");
+    expect(draft.text).toBe("typed text");
+    recorder.onTranscript?.("new paragraph mistaken words scratch that corrected words");
+    expect(draft.text).toBe("typed text corrected words");
+    session.dispose();
+  });
+  it("does not erase a selection for a filler-only chunk", async () => {
+    const draft = createDraft("replace me", 0);
+    draft.selectionEnd = 10;
+    const { session, recorder } = createSession({
+      draft,
+      formatTranscript: createDictationFormatter(DEFAULT_DICTATION_SETTINGS),
+    });
+    await session.start();
+    recorder.onTranscript?.("um");
+    expect(draft.text).toBe("replace me");
+    recorder.onTranscript?.("um new words");
+    expect(draft.text).toBe("new words");
+    session.dispose();
+  });
+});
+
+describe("post-dictation polish handoff", () => {
+  it("hands off the complete draft after final words and releases the busy state first", async () => {
+    const draft = createDraft("hello", 5);
+    const { session, completions } = createSession({
+      draft,
+      transcribe: async () => ({ text: "world", locale: "en" }),
+    });
+    await session.start();
+    await session.stop();
+    expect(completions).toEqual([
+      { ownerKey: draft.ownerKey, text: "hello world", selectionStart: 0, selectionEnd: 11 },
+    ]);
+    await session.stop();
+    expect(completions).toHaveLength(1);
+  });
+  it("preserves edits made after the last live chunk in the handoff", async () => {
+    const draft = createDraft("", 0);
+    const { session, recorder, completions } = createSession({
+      draft,
+      transcribe: async () => ({ text: "hello", locale: "en" }),
+    });
+    await session.start();
+    recorder.onTranscript?.("hello");
+    draft.text = "hello edited";
+    await session.stop();
+    expect(completions[0]?.text).toBe("hello edited");
+  });
+  it("does not polish cancelled or failed recordings", async () => {
+    const draft = createDraft("", 0);
+    const { session, recorder, completions } = createSession({
+      draft,
+      transcribe: async () => ({ text: "hello", locale: "en" }),
+    });
+    await session.start();
+    recorder.onTranscript?.("hello");
+    session.cancel();
+    expect(completions).toEqual([]);
+    await session.start();
+    recorder.failStop = true;
+    await session.stop();
+    expect(completions).toEqual([]);
   });
 });

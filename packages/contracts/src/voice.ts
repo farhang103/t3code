@@ -1,68 +1,46 @@
 import * as Schema from "effect/Schema";
-import * as HttpApiSchema from "effect/unstable/httpapi/HttpApiSchema";
-import * as HttpServerRespondable from "effect/unstable/http/HttpServerRespondable";
-import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
+import * as Effect from "effect/Effect";
+import { ProviderInstanceId } from "./providerInstance.ts";
+import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 
-/** Cap for one-shot dictation audio, enforced against the exact byte length. */
-export const MAX_VOICE_AUDIO_BYTES = 25 * 1024 * 1024;
-
-export const VOICE_TRANSCRIBE_PATH = "/api/voice/transcribe";
-export const VOICE_AVAILABILITY_PATH = "/api/voice/availability";
-
-/** Desktop recorders emit webm/opus; Safari falls back to mp4. Both ride the same endpoint. */
-export const VOICE_TRANSCRIBE_CONTENT_TYPE = "audio/webm";
-
-/** MIME type carried in `x-voice-mime-type` so the server forwards Safari mp4 correctly. */
-export const VOICE_TRANSCRIBE_MIME_TYPE_HEADER = "x-voice-mime-type";
-
-export const VOICE_TRANSCRIBE_DEFAULT_MIME_TYPE = "audio/webm";
-
-/** Normalizes a recorder/blob MIME to the upstream set; unknown/empty falls back to webm. */
-export function normalizeVoiceAudioMimeType(mimeType: string | null | undefined): string {
-  const base = (mimeType ?? "").split(";")[0]?.trim().toLowerCase();
-  return base === "audio/mp4" ? "audio/mp4" : VOICE_TRANSCRIBE_DEFAULT_MIME_TYPE;
-}
-
-/** Upstream filename matching the normalized MIME (`recording.mp4` for Safari, else webm). */
-export function voiceAudioFileNameForMimeType(mimeType: string | null | undefined): string {
-  return normalizeVoiceAudioMimeType(mimeType) === "audio/mp4" ? "recording.mp4" : "recording.webm";
-}
-
-/** Raw recording bytes for POST /api/voice/transcribe. */
-export const VoiceAudioPayload = Schema.Uint8Array.pipe(
-  HttpApiSchema.asUint8Array({ contentType: VOICE_TRANSCRIBE_CONTENT_TYPE }),
-);
-export type VoiceAudioPayload = typeof VoiceAudioPayload.Type;
-
-export const VoiceTranscribeResponse = Schema.Struct({
-  transcript: Schema.String,
+// Bound abandoned sessions even when the client disappears without stopping.
+export const VOICE_SESSION_LIMIT_SECONDS = 360;
+export const VoiceStartRequest = Schema.Struct({
+  instanceId: ProviderInstanceId,
+  sdp: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64_000)),
 });
-export type VoiceTranscribeResponse = typeof VoiceTranscribeResponse.Type;
+export const VoiceStartResponse = Schema.Struct({ sessionId: Schema.String, sdp: Schema.String });
+export const VoiceStopRequest = Schema.Struct({ sessionId: Schema.String });
+export const VoiceAvailabilityQuery = Schema.Struct({ instanceId: ProviderInstanceId });
+export const VoiceAvailabilityResponse = Schema.Struct({ codexVoiceAvailable: Schema.Boolean });
 
-export const VoiceAvailabilityResponse = Schema.Struct({
-  codexVoiceAvailable: Schema.Boolean,
+export const VoiceFinishRequest = Schema.Struct({
+  sessionId: Schema.String,
+  text: Schema.String.check(Schema.isMaxLength(30_000)),
 });
-export type VoiceAvailabilityResponse = typeof VoiceAvailabilityResponse.Type;
+export const VoiceFinishResponse = Schema.Struct({ text: Schema.String });
 
-/** Explicit unsupported marker for non-Codex providers; the mic stays visible but disabled. */
-export class VoiceProviderUnsupportedError extends Schema.TaggedError<VoiceProviderUnsupportedError>()(
-  "VoiceProviderUnsupportedError",
-  {
-    message: Schema.String,
-  },
-  { httpApiStatus: 400 },
-) {
-  [HttpServerRespondable.symbol]() {
-    return HttpServerResponse.schemaJson(VoiceProviderUnsupportedError)(this, { status: 400 });
-  }
-}
+export const VoicePolishStyle = Schema.Literals(["cleanup", "concise", "formal", "casual"]);
+export type VoicePolishStyle = typeof VoicePolishStyle.Type;
+export const VoicePolishRequest = Schema.Struct({
+  instanceId: ProviderInstanceId,
+  text: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(30_000)),
+  style: VoicePolishStyle,
+});
 
-/** v1 supports the Codex subscription only (`codex`; `claudeAgent` counts as unsupported). */
-export const isVoiceSupportedDriver = (driver: string): boolean => driver === "codex";
-
-/** Bounded unsupported message naming configured drivers, never credential material. */
-export const voiceUnsupportedMessage = (configuredDrivers: ReadonlyArray<string>): string => {
-  const unsupported = configuredDrivers.filter((driver) => !isVoiceSupportedDriver(driver));
-  const detail = unsupported.length > 0 ? unsupported.join(", ") : "none configured";
-  return `Voice dictation supports Codex only in v1 (unsupported: ${detail}).`;
-};
+export const DictationReplacement = Schema.Struct({
+  kind: Schema.Literals(["word", "snippet"]),
+  phrase: TrimmedNonEmptyString.check(Schema.isMaxLength(100)),
+  replacement: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4000)),
+});
+export type DictationReplacement = typeof DictationReplacement.Type;
+export const DictationSettings = Schema.Struct({
+  autoPolish: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  spokenCommands: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  removeFillers: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  replacements: Schema.Array(DictationReplacement)
+    .check(Schema.isMaxLength(200))
+    .pipe(Schema.withDecodingDefault(Effect.succeed([]))),
+});
+export type DictationSettings = typeof DictationSettings.Type;
+export const DEFAULT_DICTATION_SETTINGS = Schema.decodeSync(DictationSettings)({});

@@ -19,3 +19,4 @@ export {
   type VoiceTranscriptionErrorCode,
   type VoiceTranscriptionOptions,
 } from "./transcription.ts";
+export { voiceAvailability, startVoice, stopVoice, finishVoice, polishVoice } from "./http.ts";

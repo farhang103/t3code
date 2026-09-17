@@ -54,24 +54,19 @@ import {
   RelayLinkProofRequest,
 } from "./relay.ts";
 import {
-  VOICE_AVAILABILITY_PATH,
-  VOICE_TRANSCRIBE_PATH,
-  VoiceAudioPayload,
+  VoiceFinishRequest,
+  VoicePolishRequest,
+  VoiceFinishResponse,
+  VoiceStartRequest,
+  VoiceStartResponse,
+  VoiceStopRequest,
+  VoiceAvailabilityQuery,
   VoiceAvailabilityResponse,
-  VoiceProviderUnsupportedError,
-  VoiceTranscribeResponse,
 } from "./voice.ts";
 
 const OptionalBearerHeaders = Schema.Struct({
   authorization: Schema.optionalKey(Schema.String),
   dpop: Schema.optionalKey(Schema.String),
-});
-
-const VoiceTranscribeHeaders = Schema.Struct({
-  authorization: Schema.optionalKey(Schema.String),
-  dpop: Schema.optionalKey(Schema.String),
-  // Recorder MIME (e.g. Safari `audio/mp4`); absent/unknown means `audio/webm`.
-  "x-voice-mime-type": Schema.optionalKey(Schema.String),
 });
 
 const OptionalDpopProofHeaders = Schema.Struct({
@@ -630,27 +625,52 @@ class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
     }),
   ) {}
 
-/** Codex-native one-shot dictation: binary audio in, editable transcript out. */
+const EnvironmentVoiceErrors = [
+  EnvironmentHttpBadRequestError,
+  EnvironmentHttpForbiddenError,
+  EnvironmentHttpInternalServerError,
+  EnvironmentScopeRequiredError,
+];
+
 export class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice")
   .add(
-    HttpApiEndpoint.get("availability", VOICE_AVAILABILITY_PATH, {
+    HttpApiEndpoint.post("polish", "/api/voice/polish", {
       headers: OptionalBearerHeaders,
-      success: VoiceAvailabilityResponse,
-      error: [EnvironmentHttpInternalServerError, EnvironmentScopeRequiredError],
+      payload: VoicePolishRequest,
+      success: VoiceFinishResponse,
+      error: EnvironmentVoiceErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
-    HttpApiEndpoint.post("transcribe", VOICE_TRANSCRIBE_PATH, {
-      headers: VoiceTranscribeHeaders,
-      payload: VoiceAudioPayload,
-      success: VoiceTranscribeResponse,
-      error: [
-        VoiceProviderUnsupportedError,
-        EnvironmentHttpBadRequestError,
-        EnvironmentHttpForbiddenError,
-        EnvironmentHttpInternalServerError,
-        EnvironmentScopeRequiredError,
-      ],
+    HttpApiEndpoint.post("availability", "/api/voice/availability", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceAvailabilityQuery,
+      success: VoiceAvailabilityResponse,
+      error: EnvironmentVoiceErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("start", "/api/voice/start", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceStartRequest,
+      success: VoiceStartResponse,
+      error: EnvironmentVoiceErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("finish", "/api/voice/finish", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceFinishRequest,
+      success: VoiceFinishResponse,
+      error: EnvironmentVoiceErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("stop", "/api/voice/stop", {
+      headers: OptionalBearerHeaders,
+      payload: VoiceStopRequest,
+      success: Schema.Void,
+      error: EnvironmentVoiceErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 

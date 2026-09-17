@@ -77,6 +77,13 @@ function createHarness(
 }
 
 describe("resolveTranscriptCommit", () => {
+  it("attaches dictated punctuation to the word before the caret", () => {
+    const captured = draft({ text: "Ready", selection: { start: 5, end: 5 } });
+    expect(resolveTranscriptCommit(captured, captured, "?", "en-US")).toMatchObject({
+      kind: "commit",
+      text: "Ready?",
+    });
+  });
   it("replaces the recorded UTF-16 selection around emoji and composer tokens", () => {
     const text = "Fix 🧪 then $review please";
     const tokenStart = text.indexOf("$review");

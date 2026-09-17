@@ -75,6 +75,7 @@ export function resolveTranscriptCommit(
   current: VoiceDraftSnapshot | null,
   transcript: string,
   locale: string,
+  options?: { readonly preserveWhitespace?: boolean },
 ): TranscriptCommitResult {
   if (
     !current ||
@@ -85,7 +86,7 @@ export function resolveTranscriptCommit(
     return { kind: "stale" };
   }
 
-  const replacement = transcript.trim();
+  const replacement = options?.preserveWhitespace ? transcript : transcript.trim();
   if (replacement.length === 0) {
     return { kind: "empty" };
   }
@@ -98,10 +99,12 @@ export function resolveTranscriptCommit(
     const left = captured.text[captured.selection.start - 1];
     const right = captured.text[captured.selection.start];
     const leftNeedsBoundary =
+      !/^[\s.,!?:;)}\]]/.test(replacement) &&
       left !== undefined &&
       /[A-Za-z0-9.!?,:;)\]}'"]/.test(left) &&
       (right === undefined || /\s/.test(right));
     const rightNeedsBoundary =
+      !/\s$/.test(replacement) &&
       right !== undefined &&
       /[A-Za-z0-9([{'"]/.test(right) &&
       (left === undefined || /\s/.test(left));

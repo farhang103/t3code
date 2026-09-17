@@ -1,52 +1,65 @@
 import {
   AuthOrchestrationOperateScope,
   EnvironmentHttpApi,
-  EnvironmentHttpBadRequestError,
-  VOICE_TRANSCRIBE_MIME_TYPE_HEADER,
+  EnvironmentAuthenticatedPrincipal,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import { HttpServerRequest } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
-
 import { annotateEnvironmentRequest, requireEnvironmentScope } from "../auth/http.ts";
-import {
-  checkCodexVoiceAvailability,
-  resolveVoiceDeclaredLengthError,
-  transcribeCodexVoice,
-} from "./VoiceTranscription.ts";
+import { codexVoiceAvailable, makeCodexVoiceSessions } from "./CodexVoice.ts";
 
-/** Voice routes: availability plus binary one-shot transcription, both operate-scoped. */
 export const voiceHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "voice",
   Effect.fnUntraced(function* (handlers) {
+    const sessions = yield* makeCodexVoiceSessions();
+    const authorize = Effect.fn("voice.authorize")(function* (endpoint: string) {
+      yield* annotateEnvironmentRequest(endpoint);
+      yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+      return (yield* EnvironmentAuthenticatedPrincipal).sessionId;
+    });
     return handlers
       .handle(
-        "availability",
-        Effect.fn("environment.voice.availability")(function* (args) {
-          yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-          const codexVoiceAvailable = yield* checkCodexVoiceAvailability;
-          return { codexVoiceAvailable };
+        "polish",
+        Effect.fn("environment.voice.polish")(function* (args) {
+          yield* authorize(args.endpoint.name);
+          return {
+            text: yield* sessions.polish(
+              args.payload.instanceId,
+              args.payload.text,
+              args.payload.style,
+            ),
+          };
         }),
       )
       .handle(
-        "transcribe",
-        Effect.fn("environment.voice.transcribe")(function* (args) {
-          yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-          const request = yield* HttpServerRequest.HttpServerRequest;
-          const lengthError = resolveVoiceDeclaredLengthError(
-            request.headers["content-length"],
-            args.payload.byteLength,
-          );
-          if (lengthError !== null) {
-            return yield* new EnvironmentHttpBadRequestError({ message: lengthError });
-          }
-          return yield* transcribeCodexVoice(
-            args.payload,
-            args.headers[VOICE_TRANSCRIBE_MIME_TYPE_HEADER],
-          );
+        "availability",
+        Effect.fn("environment.voice.availability")(function* (args) {
+          const owner = yield* authorize(args.endpoint.name);
+          const available = yield* codexVoiceAvailable(args.payload.instanceId);
+          if (available) yield* sessions.warm(owner, args.payload.instanceId).pipe(Effect.ignore);
+          return { codexVoiceAvailable: available };
+        }),
+      )
+      .handle(
+        "start",
+        Effect.fn("environment.voice.start")(function* (args) {
+          const owner = yield* authorize(args.endpoint.name);
+          return yield* sessions.start(owner, args.payload.instanceId, args.payload.sdp);
+        }),
+      )
+      .handle(
+        "finish",
+        Effect.fn("environment.voice.finish")(function* (args) {
+          const owner = yield* authorize(args.endpoint.name);
+          return { text: yield* sessions.finish(owner, args.payload.sessionId, args.payload.text) };
+        }),
+      )
+      .handle(
+        "stop",
+        Effect.fn("environment.voice.stop")(function* (args) {
+          const owner = yield* authorize(args.endpoint.name);
+          yield* sessions.stop(owner, args.payload.sessionId);
         }),
       );
   }),

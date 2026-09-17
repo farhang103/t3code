@@ -836,6 +836,7 @@ function collectContextIds(node: LexicalNode): string[] {
 
 export interface ComposerPromptEditorHandle {
   focus: () => void;
+  focusPreservingSelection: () => void;
   focusAt: (cursor: number) => void;
   focusAtEnd: () => void;
   readSelectionRange: () => { start: number; end: number };
@@ -1843,6 +1844,7 @@ function ComposerPromptEditorInner({
   useImperativeHandle(
     editorRef,
     () => ({
+      focusPreservingSelection: () => editor.focus(),
       focus: () => {
         focusAt(snapshotRef.current.cursor);
       },

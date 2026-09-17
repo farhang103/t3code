@@ -1,9 +1,17 @@
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
-import { $copyNode, $getRoot, $isElementNode, PASTE_COMMAND, type LexicalEditor } from "lexical";
-import { act, createRef } from "react";
+import {
+  $copyNode,
+  $getRoot,
+  $isElementNode,
+  $isTextNode,
+  PASTE_COMMAND,
+  type LexicalEditor,
+} from "lexical";
+import { act, createRef, useEffect, useState } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { ComposerVoiceSession } from "../voice/composerVoiceSession";
 import { collapseExpandedComposerCursor } from "../composer-logic";
 import { ComposerPromptEditor, type ComposerPromptEditorHandle } from "./ComposerPromptEditor";
 
@@ -179,5 +187,98 @@ describe("composer mention serialization", () => {
     expect(event.defaultPrevented).toBe(true);
     expect(editorRef.current?.readSnapshot().value).toBe("[README.md](README.md) ");
     expect(lexicalEditor.getEditorState().read(() => $firstMention().isInline())).toBe(true);
+  });
+});
+
+describe("dictation in the editable composer", () => {
+  it("continues at a selected range and then at a moved caret in the real editor", async () => {
+    let replaceDraft = (_text: string, _cursor: number) => {};
+    function EditableDraft() {
+      const [draft, setDraft] = useState({ text: "hello world", cursor: 11 });
+      useEffect(() => {
+        replaceDraft = (text, cursor) => setDraft({ text, cursor });
+      }, []);
+      return (
+        <ComposerPromptEditor
+          value={draft.text}
+          cursor={draft.cursor}
+          contextRecords={new Map()}
+          skills={[]}
+          disabled={false}
+          placeholder="Write a prompt"
+          onChange={(text, cursor) => setDraft({ text, cursor })}
+          onPaste={() => {}}
+          editorRef={editorRef}
+        />
+      );
+    }
+    await act(() => {
+      renderer = create(<EditableDraft />);
+    });
+    const callbacks = { transcript: (_text: string) => {} };
+    const session = new ComposerVoiceSession({
+      readDraft: () => {
+        const snapshot = editorRef.current!.readSnapshot();
+        const range = editorRef.current!.readSelectionRange();
+        return {
+          ownerKey: "draft",
+          text: snapshot.value,
+          selectionStart: range.start,
+          selectionEnd: range.end,
+        };
+      },
+      commitDraft: (commit) => {
+        const text = editorRef.current!.readSnapshot().value;
+        if (text.slice(commit.rangeStart, commit.rangeEnd) !== commit.expectedText) return false;
+        const next =
+          text.slice(0, commit.rangeStart) + commit.insertion + text.slice(commit.rangeEnd);
+        replaceDraft(
+          next,
+          collapseExpandedComposerCursor(next, commit.rangeStart + commit.insertion.length),
+        );
+        return true;
+      },
+      requestMicrophone: async () => ({ getTracks: () => [] }) as unknown as MediaStream,
+      createRecorder: (_stream, events) => {
+        callbacks.transcript = events.onTranscript;
+        return {
+          start: () => {},
+          stop: async () => ({ text: "everyone first", locale: "en" }),
+          dispose: () => {},
+        };
+      },
+      onStateChange: () => {},
+    });
+    await act(() => {
+      lexicalEditor.update(
+        () => {
+          const node = $getRoot().getFirstDescendant();
+          if (!$isTextNode(node)) throw new Error("Expected text");
+          node.select(6, 11);
+        },
+        { discrete: true },
+      );
+    });
+    await act(() => editorRef.current!.focusPreservingSelection());
+    expect(editorRef.current!.readSelectionRange()).toEqual({ start: 6, end: 11 });
+    await act(() => session.start());
+    await act(() => callbacks.transcript("everyone"));
+    expect(editorRef.current!.readSnapshot().value).toBe("hello everyone");
+    await act(() => {
+      lexicalEditor.update(
+        () => {
+          const node = $getRoot().getFirstDescendant();
+          if (!$isTextNode(node)) throw new Error("Expected text");
+          node.select(0, 0);
+        },
+        { discrete: true },
+      );
+    });
+    await act(() => callbacks.transcript("everyone first"));
+    expect(editorRef.current!.readSnapshot().value).toBe("first hello everyone");
+    expect(editorRef.current!.readSelectionRange()).toEqual({ start: 6, end: 6 });
+    await act(() => session.stop());
+    expect(editorRef.current!.readSnapshot().value).toBe("first hello everyone");
+    session.dispose();
   });
 });

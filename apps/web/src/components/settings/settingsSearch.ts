@@ -91,6 +91,16 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
  */
 export const SETTINGS_SEARCH_ITEMS = [
   {
+    id: "dictation",
+    title: "Dictation",
+    to: "/settings/general",
+    targetId: "dictation",
+    scope: "environment",
+    searchTerms: [
+      "voice microphone punctuation dictionary custom words snippets filler scratch that AI polish",
+    ],
+  },
+  {
     id: "project-defaults",
     title: "Project defaults and overrides",
     to: "/settings/general",

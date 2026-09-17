@@ -1,0 +1,275 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { ProviderInstanceId } from "@t3tools/contracts";
+import { expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
+import * as Layer from "effect/Layer";
+import { vi } from "vite-plus/test";
+import { layerTest } from "../serverSettings.ts";
+import { codexVoiceAvailable, makeCodexVoiceSessions } from "./CodexVoice.ts";
+
+const fixture = vi.hoisted(() => ({
+  accountType: "chatgpt",
+  closed: 0,
+  prepared: null as null | (() => void),
+  failStart: false,
+  waitForEdit: null as null | (() => Promise<void>),
+  formatted: '{"text":"Can you check the microphone, please?"}',
+  calls: [] as Array<{ method: string; params: unknown }>,
+}));
+
+vi.mock("../provider/Layers/CodexProvider.ts", () => ({
+  withCodexAppServerClient: () =>
+    Effect.gen(function* () {
+      const handlers = new Map<
+        string,
+        (event: {
+          threadId: string;
+          sdp: string;
+          item?: { type: string; text: string };
+          turn?: { status: string };
+        }) => Effect.Effect<void>
+      >();
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          fixture.closed++;
+        }),
+      );
+      return {
+        client: {
+          request: (method: string, params: unknown) =>
+            Effect.gen(function* () {
+              if (method === "turn/start") {
+                fixture.calls.push({ method, params });
+                if (fixture.waitForEdit) yield* Effect.promise(fixture.waitForEdit);
+                yield* (
+                  handlers.get("item/completed")?.({
+                    threadId: "dictation-thread",
+                    sdp: "",
+                    item: { type: "agentMessage", text: fixture.formatted },
+                  }) ?? Effect.void
+                );
+                yield* (
+                  handlers.get("turn/completed")?.({
+                    threadId: "dictation-thread",
+                    sdp: "",
+                    turn: { status: "completed" },
+                  }) ?? Effect.void
+                );
+                return {};
+              }
+              return { account: { type: fixture.accountType } };
+            }),
+          handleServerNotification: (
+            method: string,
+            handler: (event: {
+              threadId: string;
+              sdp: string;
+              item?: { type: string; text: string };
+              turn?: { status: string };
+            }) => Effect.Effect<void>,
+          ) =>
+            Effect.sync(() => {
+              handlers.set(method, handler);
+            }),
+          raw: {
+            request: (method: string, params: unknown) =>
+              Effect.gen(function* () {
+                fixture.calls.push({ method, params });
+                if (method === "thread/start") {
+                  fixture.prepared?.();
+                  return { thread: { id: "dictation-thread" } };
+                }
+                if (method === "thread/realtime/start") {
+                  if (fixture.failStart)
+                    return yield* Effect.fail({
+                      _tag: "ProbeError" as const,
+                      message: "secret upstream error",
+                    });
+                  yield* (
+                    handlers.get("thread/realtime/sdp")?.({
+                      threadId: "dictation-thread",
+                      sdp: "answer",
+                    }) ?? Effect.void
+                  );
+                }
+                return {};
+              }),
+          },
+        },
+      };
+    }),
+}));
+
+const dependencies = Layer.mergeAll(NodeServices.layer, layerTest());
+const instance = ProviderInstanceId.make("codex");
+
+it.effect("negotiates a separate ephemeral thread and only its owner can stop it", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.calls = [];
+    fixture.closed = 0;
+    const sessions = yield* makeCodexVoiceSessions();
+    const result = yield* sessions.start("owner", instance, "offer");
+    expect(result.sdp).toBe("answer");
+    expect(fixture.closed).toBe(0);
+    expect(fixture.calls[0]).toMatchObject({
+      method: "thread/start",
+      params: {
+        ephemeral: true,
+        sandbox: "read-only",
+        approvalPolicy: "never",
+        environments: [],
+      },
+    });
+    expect(fixture.calls.some((call) => call.method === "turn/start")).toBe(false);
+    expect((yield* Effect.result(sessions.start("owner", instance, "offer")))._tag).toBe("Failure");
+    expect((yield* Effect.result(sessions.stop("other", result.sessionId)))._tag).toBe("Failure");
+    expect(fixture.closed).toBe(0);
+    yield* sessions.stop("owner", result.sessionId);
+    yield* sessions.stop("owner", result.sessionId);
+    expect(fixture.closed).toBe(1);
+    expect(fixture.calls.at(-1)?.method).toBe("thread/realtime/stop");
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("rejects API-key accounts and releases failed sessions for retry", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "apiKey";
+    fixture.closed = 0;
+    const sessions = yield* makeCodexVoiceSessions();
+    expect((yield* Effect.result(sessions.start("owner", instance, "offer")))._tag).toBe("Failure");
+    expect(fixture.closed).toBe(1);
+    fixture.accountType = "chatgpt";
+    fixture.failStart = true;
+    expect((yield* Effect.result(sessions.start("owner", instance, "offer")))._tag).toBe("Failure");
+    expect(fixture.closed).toBe(2);
+    fixture.failStart = false;
+    const result = yield* sessions.start("owner", instance, "offer");
+    yield* sessions.stop("owner", result.sessionId);
+    expect(fixture.closed).toBe(3);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("reports non-Codex instances unavailable without starting a CLI", () =>
+  Effect.gen(function* () {
+    expect(yield* codexVoiceAvailable(ProviderInstanceId.make("claudeAgent"))).toBe(false);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("reuses preparation and releases unused warm processes", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.calls = [];
+    fixture.closed = 0;
+    const sessions = yield* makeCodexVoiceSessions();
+    yield* Effect.all([sessions.warm("owner", instance), sessions.warm("owner", instance)], {
+      concurrency: "unbounded",
+    });
+    const recording = yield* sessions.start("owner", instance, "offer");
+    expect(fixture.calls.filter((call) => call.method === "thread/start")).toHaveLength(1);
+    yield* TestClock.adjust("2 minutes");
+    expect(fixture.closed).toBe(0);
+    const ready = Promise.withResolvers<void>();
+    fixture.prepared = () => ready.resolve();
+    yield* sessions.stop("owner", recording.sessionId);
+    yield* Effect.promise(() => ready.promise);
+    fixture.prepared = null;
+    yield* TestClock.adjust("1 minute");
+    yield* sessions.warm("owner", instance);
+    yield* TestClock.adjust("1 minute");
+    expect(fixture.closed).toBe(1);
+    yield* TestClock.adjust("1 minute");
+    expect(fixture.closed).toBe(2);
+  }).pipe(Effect.provide(dependencies)),
+);
+it.effect("formats only the owner's recording and rejects changed words", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.formatted = '{"text":"Can you check the microphone, please?"}';
+    const sessions = yield* makeCodexVoiceSessions();
+    const recording = yield* sessions.start("owner", instance, "offer");
+    expect(
+      (yield* Effect.result(sessions.finish("someone-else", recording.sessionId, "text")))._tag,
+    ).toBe("Failure");
+    expect(
+      yield* sessions.finish("owner", recording.sessionId, "can you check the microphone please"),
+    ).toBe("Can you check the microphone, please?");
+    const second = yield* sessions.start("owner", instance, "offer");
+    fixture.formatted = '{"text":"Yes, I can check it."}';
+    expect(yield* sessions.finish("owner", second.sessionId, "can you check it")).toBe(
+      "can you check it",
+    );
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("polishes on demand without opening realtime or consuming the warm recording slot", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.calls = [];
+    fixture.closed = 0;
+    fixture.formatted = '{"text":"Please check the microphone."}';
+    const sessions = yield* makeCodexVoiceSessions();
+    yield* sessions.warm("owner", instance);
+    expect(yield* sessions.polish(instance, "um could you check the microphone", "concise")).toBe(
+      "Please check the microphone.",
+    );
+    expect(fixture.calls.find((call) => call.method === "turn/start")).toMatchObject({
+      params: { model: "gpt-5.6-luna", effort: "medium" },
+    });
+    expect(fixture.closed).toBe(1);
+    expect(fixture.calls.some((call) => call.method === "thread/realtime/start")).toBe(false);
+    const recording = yield* sessions.start("owner", instance, "offer");
+    expect(fixture.calls.filter((call) => call.method === "thread/start")).toHaveLength(2);
+    yield* sessions.stop("owner", recording.sessionId);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("releases failed AI edits and reports the failure instead of replacing the draft", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.closed = 0;
+    fixture.formatted = '{"text":""}';
+    const sessions = yield* makeCodexVoiceSessions();
+    expect((yield* Effect.result(sessions.polish(instance, "keep my draft", "cleanup")))._tag).toBe(
+      "Failure",
+    );
+    expect(fixture.closed).toBe(1);
+    fixture.formatted = '{"text":"Keep my draft."}';
+    expect(yield* sessions.polish(instance, "keep my draft", "cleanup")).toBe("Keep my draft.");
+    expect(fixture.closed).toBe(2);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("keeps recording available while an optional AI suggestion is pending", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.calls = [];
+    fixture.closed = 0;
+    fixture.formatted = '{"text":"A shorter draft."}';
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    fixture.waitForEdit = () => {
+      entered.resolve();
+      return release.promise;
+    };
+    const sessions = yield* makeCodexVoiceSessions();
+    const editing = yield* sessions
+      .polish(instance, "a draft to shorten", "concise")
+      .pipe(Effect.forkScoped);
+    yield* Effect.promise(() => entered.promise);
+    const recording = yield* sessions.start("owner", instance, "offer");
+    expect(recording.sdp).toBe("answer");
+    expect(fixture.closed).toBe(0);
+    release.resolve();
+    expect(yield* Fiber.join(editing)).toBe("A shorter draft.");
+    fixture.waitForEdit = null;
+    yield* sessions.stop("owner", recording.sessionId);
+  }).pipe(Effect.provide(dependencies)),
+);
