@@ -113,6 +113,7 @@ const prepareVoice = Effect.fn("CodexVoice.prepare")(function* ({
       config: {
         model_reasoning_effort: "low",
         "features.shell_tool": false,
+        "features.unified_exec": false,
         "features.apply_patch_freeform": false,
         "features.multi_agent": false,
         "features.apps": false,

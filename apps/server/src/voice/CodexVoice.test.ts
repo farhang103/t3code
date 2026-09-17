@@ -203,6 +203,10 @@ it.effect("disables inherited MCP servers and verifies the runtime before polish
         dynamicTools: [],
         selectedCapabilityRoots: [],
         config: {
+          "features.shell_tool": false,
+          "features.unified_exec": false,
+          "features.apply_patch_freeform": false,
+          "features.multi_agent": false,
           "features.apps": false,
           "features.plugins": false,
           mcp_servers: { "work.tools": { enabled: false, enabled_tools: [] } },
