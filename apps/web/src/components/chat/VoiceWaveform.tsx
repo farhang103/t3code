@@ -93,8 +93,12 @@ export function VoiceWaveform({ stream }: { readonly stream: MediaStream | null 
     };
     document.addEventListener("visibilitychange", visibilityChanged);
     frame = requestAnimationFrame(draw);
-    void audio.resume().catch(() => setUnavailable(true));
+    let disposed = false;
+    void audio.resume().catch(() => {
+      if (!disposed) setUnavailable(true);
+    });
     return () => {
+      disposed = true;
       cancelAnimationFrame(frame);
       observer.disconnect();
       document.removeEventListener("visibilitychange", visibilityChanged);

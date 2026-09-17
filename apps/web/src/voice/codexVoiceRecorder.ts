@@ -35,6 +35,7 @@ export function createCodexVoiceRecorder(
   let stream: MediaStream | null = null;
   let transcript = "";
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
+  let disconnectTimer: ReturnType<typeof setTimeout> | undefined;
   const seen = new Set<string>();
   let sessionId: string | null = null;
   let disposed = false;
@@ -98,8 +99,19 @@ export function createCodexVoiceRecorder(
     callbacks.onError(error);
   };
   peer.onconnectionstatechange = () => {
-    if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
+    if (disposed) return;
+    if (peer.connectionState !== "disconnected") {
+      clearTimeout(disconnectTimer);
+      disconnectTimer = undefined;
+    }
+    if (peer.connectionState === "failed") {
       fail("Voice connection was interrupted. Please try again.");
+    } else if (peer.connectionState === "disconnected" && disconnectTimer === undefined) {
+      disconnectTimer = setTimeout(() => {
+        disconnectTimer = undefined;
+        if (peer.connectionState === "disconnected")
+          fail("Voice connection was interrupted. Please try again.");
+      }, 5000);
     }
   };
   channel.onclose = () => fail("Voice connection ended. Please try again.");
@@ -178,6 +190,7 @@ export function createCodexVoiceRecorder(
       clearTimeout(finishTimer);
       clearTimeout(deadline);
       clearTimeout(previewTimer);
+      clearTimeout(disconnectTimer);
       rejectStart?.(new Error("Voice input was cancelled."));
       pendingStop?.reject(new Error("Voice input was cancelled."));
       pendingStop = null;

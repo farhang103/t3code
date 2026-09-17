@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { ProviderDriverKind, ProviderInstanceId } from "@t3tools/contracts";
+import * as Path from "effect/Path";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -17,11 +18,13 @@ const fixture = vi.hoisted(() => ({
   waitForEdit: null as null | (() => Promise<void>),
   formatted: '{"text":"Can you check the microphone, please?"}',
   calls: [] as Array<{ method: string; params: unknown }>,
+  launches: [] as unknown[],
 }));
 
 vi.mock("../provider/Layers/CodexProvider.ts", () => ({
-  withCodexAppServerClient: () =>
+  withCodexAppServerClient: (options: unknown) =>
     Effect.gen(function* () {
+      fixture.launches.push(options);
       const handlers = new Map<
         string,
         (event: {
@@ -104,6 +107,63 @@ vi.mock("../provider/Layers/CodexProvider.ts", () => ({
 
 const dependencies = Layer.mergeAll(NodeServices.layer, layerTest());
 const instance = ProviderInstanceId.make("codex");
+
+it.effect("uses the selected enabled account and refuses disabled or missing instances", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.launches = [];
+    const path = yield* Path.Path;
+    const sessions = yield* makeCodexVoiceSessions();
+    for (const id of ["codex", "missing"]) {
+      const rejected = ProviderInstanceId.make(id);
+      expect(yield* codexVoiceAvailable(rejected)).toBe(false);
+      const result = yield* Effect.result(sessions.start("owner", rejected, "offer"));
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "EnvironmentHttpBadRequestError" },
+      });
+    }
+    expect(fixture.launches).toEqual([]);
+    const selected = ProviderInstanceId.make("codex_work");
+    expect(yield* codexVoiceAvailable(selected)).toBe(true);
+    const result = yield* sessions.start("owner", selected, "offer");
+    expect(fixture.launches).toEqual([
+      expect.objectContaining({
+        binaryPath: "work-codex",
+        homePath: path.resolve("test-work-codex-home"),
+        launchArgs: "--verbose",
+        environment: expect.objectContaining({ T3_VOICE_ACCOUNT_TEST: "work" }),
+      }),
+    ]);
+    yield* sessions.stop("owner", result.sessionId);
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        layerTest({
+          providerInstances: {
+            [ProviderInstanceId.make("codex")]: {
+              driver: ProviderDriverKind.make("codex"),
+              enabled: false,
+              config: {},
+            },
+            [ProviderInstanceId.make("codex_work")]: {
+              driver: ProviderDriverKind.make("codex"),
+              enabled: true,
+              config: {
+                binaryPath: "work-codex",
+                homePath: "test-work-codex-home",
+                launchArgs: "--verbose",
+              },
+              environment: [{ name: "T3_VOICE_ACCOUNT_TEST", value: "work" }],
+            },
+          },
+        }),
+      ),
+    ),
+  ),
+);
 
 it.effect("negotiates a separate ephemeral thread and only its owner can stop it", () =>
   Effect.gen(function* () {

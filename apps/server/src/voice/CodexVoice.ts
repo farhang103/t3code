@@ -227,7 +227,11 @@ export const makeCodexVoiceSessions = Effect.fn("CodexVoice.makeSessions")(funct
     const startedAt = yield* Clock.currentTimeMillis;
     let prewarmed = false;
     const id = yield* crypto.randomUUIDv4.pipe(Effect.mapError(voiceFailure));
-    const resolved = yield* resolveInstance(instanceId).pipe(Effect.mapError(voiceFailure));
+    const resolved = yield* resolveInstance(instanceId).pipe(
+      Effect.mapError((error) =>
+        error._tag === "EnvironmentHttpBadRequestError" ? error : voiceFailure(),
+      ),
+    );
     const slot = yield* Effect.gen(function* () {
       if (sessions.size >= 8 || [...sessions.values()].some((session) => session.owner === owner)) {
         return yield* new EnvironmentHttpBadRequestError({

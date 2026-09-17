@@ -4,7 +4,10 @@ import {
 } from "@t3tools/client-runtime/voice-input";
 import { createDictationFormatter } from "@t3tools/shared/voicePunctuation";
 import { DEFAULT_DICTATION_SETTINGS, ProviderDriverKind } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { resetVoiceInputGlobalsForTests } from "@t3tools/client-runtime/voice-input";
+
+beforeEach(() => resetVoiceInputGlobalsForTests());
 
 import {
   ComposerVoiceSession,
@@ -496,7 +499,7 @@ describe("composer voice send and mic gating", () => {
     ).toBeNull();
   });
 
-  it("keeps the mic visible but disabled per provider state", () => {
+  it("reports unsupported providers without promising future support", () => {
     expect(
       resolveVoiceMicAvailability({
         driverKind: ProviderDriverKind.make("codex"),
@@ -510,7 +513,7 @@ describe("composer voice send and mic gating", () => {
         codexVoiceAvailable: false,
         composerDisabled: false,
       }),
-    ).toEqual({ available: false, reason: "Voice for this provider is coming soon" });
+    ).toEqual({ available: false, reason: "Voice input is unavailable for this provider" });
     expect(
       resolveVoiceMicAvailability({
         driverKind: ProviderDriverKind.make("codex"),

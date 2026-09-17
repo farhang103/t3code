@@ -24,7 +24,8 @@ Say "new line" or "new paragraph" to break up your draft, "bullet point" for a
 bullet, and "number one", "number two", etc. for numbered items. "Scratch that"
 removes the last sentence in the current dictated insertion; it does not undo
 text you typed or earlier insertions after moving the cursor. "Um" and "uh" are
-removed locally. Other words, including "actually", are kept as spoken.
+removed locally when hesitation cleanup is enabled. Other words, including
+"actually", are kept as spoken.
 
 In **Settings > General > Dictation**, select an environment to turn these
 commands or hesitation cleanup off, or manage custom word replacements and

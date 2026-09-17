@@ -1929,16 +1929,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [selectedProviderEntry],
   );
   const compactCommandAvailable = providerSupportsManualCompaction(selectedProviderEntry);
-  // Voice dictation is Codex-only for now (see
-  // `isVoiceSupportedDriver`). The mic stays visible-but-disabled for other
-  // drivers ("coming soon"); Codex availability itself is probed from
-  // GET /api/voice/availability inside ComposerVoiceInput. Desktop needs no
-  // fork — it renders this same web UI; the native mic permission
-  // (NSMicrophoneUsageDescription) is tracked separately in #5321.
+  // Web and desktop share the Codex input; unsupported providers do not mount it.
   const composerVoiceDisabled =
     isConnecting ||
     activePendingApproval !== null ||
-    pendingUserInputs.length > 0 ||
+    (pendingUserInputs.length > 0 &&
+      (!activePendingProgress?.activeQuestion ||
+        activePendingProgress.activeQuestion.allowCustomAnswer === false ||
+        activePendingIsResponding)) ||
     projectSelectionRequired ||
     environmentUnavailable !== null;
   const selectedProviderSkills = selectedProviderStatus
@@ -7047,7 +7045,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       </Tooltip>
                     </>
                   ) : null}
-                  {!voiceInputBusy && (
+                  {(!voiceInputBusy || phase === "running") && (
                     <ComposerFooterPrimaryActions
                       compact={isComposerResting || isComposerPrimaryActionsCompact}
                       activeContextWindow={

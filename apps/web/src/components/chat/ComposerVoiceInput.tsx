@@ -31,7 +31,11 @@ import {
 // validation against servers that do not know the command yet. The mic button
 // below is the supported entry point until then.
 
-export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
+export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: ComposerVoiceInputProps) {
+  return props.driverKind === "codex" ? <CodexComposerVoiceInput {...props} /> : null;
+});
+
+type ComposerVoiceInputProps = {
   readonly driverKind: ProviderDriverKind;
   readonly composerDisabled: boolean;
   readonly readDraft: () => ComposerVoiceDraft | null;
@@ -40,7 +44,9 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
   readonly environmentId: EnvironmentId;
   readonly focusDraft: () => void;
   readonly onBusyChange?: (busy: boolean) => void;
-}) {
+};
+
+function CodexComposerVoiceInput(props: ComposerVoiceInputProps) {
   const [voiceState, setVoiceState] = useState<VoiceInputState>(IDLE_COMPOSER_VOICE_STATE);
   const [completedDraft, setCompletedDraft] = useState<ComposerVoiceDraft | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -117,9 +123,7 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
   }, [voiceState.phase]);
 
   const busy = voiceInputBlocksSubmission(voiceState);
-  // Authoritative availability comes from POST /api/voice/availability;
-  // the driver gate keeps the mic visible-but-disabled ("coming soon") for
-  // every non-Codex provider.
+  // Only supported providers mount this input or probe availability.
   const { available: serverVoiceAvailable, prepare: prepareVoice } = useCodexVoiceAvailability(
     props.environmentId,
     props.instanceId,
@@ -325,4 +329,4 @@ export const ComposerVoiceInput = memo(function ComposerVoiceInput(props: {
       )}
     </div>
   );
-});
+}

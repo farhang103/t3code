@@ -37,11 +37,14 @@ describe("Codex realtime transcription", () => {
 const network = vi.hoisted(() => ({
   start: vi.fn(),
   stop: vi.fn(),
+  readConnection: vi.fn(),
+  startRequest: vi.fn(),
+  stopRequest: vi.fn(),
 }));
-vi.mock("../state/session", () => ({ readPreparedConnection: () => ({}) }));
+vi.mock("../state/session", () => ({ readPreparedConnection: network.readConnection }));
 vi.mock("@t3tools/client-runtime/voice-input", () => ({
-  startVoice: () => ({ kind: "start" }),
-  stopVoice: () => ({ kind: "stop" }),
+  startVoice: network.startRequest,
+  stopVoice: network.stopRequest,
 }));
 vi.mock("../lib/runtime", () => ({
   runtime: {
@@ -55,6 +58,12 @@ vi.mock("../lib/runtime", () => ({
 
 class VoicePeer {
   static current: VoicePeer;
+  connectionState = "connected";
+  onconnectionstatechange: (() => void) | null = null;
+  setConnectionState(state: string) {
+    this.connectionState = state;
+    this.onconnectionstatechange?.();
+  }
   channel = {
     readyState: "open",
     onmessage: null as ((event: { data: string }) => void) | null,
@@ -116,10 +125,51 @@ describe("live recorder completion", () => {
     vi.stubGlobal("navigator", { language: "en-US" });
     network.start.mockReset();
     network.stop.mockReset();
+    network.readConnection.mockReset().mockReturnValue({ environment: "original" });
+    network.startRequest.mockReset().mockReturnValue({ kind: "start" });
+    network.stopRequest.mockReset().mockReturnValue({ kind: "stop" });
   });
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+  it("pins start and cleanup to the selected environment and account", async () => {
+    const { recorder } = createRecorderHarness();
+    const original = network.readConnection.mock.results[0]?.value;
+    expect(network.readConnection).toHaveBeenCalledExactlyOnceWith("env");
+    network.readConnection.mockReturnValue({ environment: "different" });
+    await recorder.start();
+    expect(network.startRequest).toHaveBeenCalledExactlyOnceWith(original, "codex", "offer");
+    recorder.dispose();
+    expect(network.stopRequest).toHaveBeenCalledExactlyOnceWith(original, "session");
+    expect(network.readConnection).toHaveBeenCalledTimes(1);
+  });
+  it("survives a brief disconnect but reports a persistent loss", async () => {
+    const { recorder, callbacks } = createRecorderHarness();
+    await recorder.start();
+    VoicePeer.current.setConnectionState("disconnected");
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(callbacks.onError).not.toHaveBeenCalled();
+    VoicePeer.current.setConnectionState("connected");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(callbacks.onError).not.toHaveBeenCalled();
+    VoicePeer.current.setConnectionState("disconnected");
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(callbacks.onError).toHaveBeenCalledOnce();
+    recorder.dispose();
+  });
+  it("clears disconnect cleanup timers and fails immediately on terminal failure", async () => {
+    const first = createRecorderHarness();
+    await first.recorder.start();
+    VoicePeer.current.setConnectionState("disconnected");
+    first.recorder.dispose();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(first.callbacks.onError).not.toHaveBeenCalled();
+    const second = createRecorderHarness();
+    await second.recorder.start();
+    VoicePeer.current.setConnectionState("failed");
+    expect(second.callbacks.onError).toHaveBeenCalledOnce();
+    second.recorder.dispose();
   });
   it("batches live chunks and finishes without a second AI request", async () => {
     const { recorder, callbacks, track } = createRecorderHarness();
