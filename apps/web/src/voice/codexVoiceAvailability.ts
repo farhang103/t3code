@@ -16,22 +16,28 @@ export function useCodexVoiceAvailability(
   const key = `${environmentId}:${instanceId}`;
   const [result, setResult] = useState<{ key: string; available: boolean } | null>(null);
   useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- A new connection or probe lifetime invalidates the previous server response.
+    setResult(null);
     if (!enabled) return;
     if (!prepared) return;
     lastWarm.current = 0;
     const aborter = new AbortController();
+    let generation = 0;
     const warm = () => {
       if (document.visibilityState === "hidden" || Date.now() - lastWarm.current < 15_000) return;
       lastWarm.current = Date.now();
+      const requestGeneration = ++generation;
+      setResult(null);
       void runtime
         .runPromise(voiceAvailability(prepared, instanceId), { signal: aborter.signal })
         .then(
           (response) => {
-            if (!aborter.signal.aborted)
+            if (!aborter.signal.aborted && requestGeneration === generation)
               setResult({ key, available: response.codexVoiceAvailable });
           },
           () => {
-            if (!aborter.signal.aborted) setResult({ key, available: false });
+            if (!aborter.signal.aborted && requestGeneration === generation)
+              setResult({ key, available: false });
           },
         );
     };
