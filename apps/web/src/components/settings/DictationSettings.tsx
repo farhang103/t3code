@@ -24,7 +24,7 @@ function DictationSettingsForm() {
   const { scope, connectedEnvironments } = useSettingsScope();
   const enabled =
     (scope.kind === "environment" || scope.kind === "all") && connectedEnvironments.length === 1;
-  const [editing, setEditing] = useState<string | null>(null);
+  const [editing, setEditing] = useState<DictationReplacement | null>(null);
   const [kind, setKind] = useState<DictationReplacement["kind"]>("word");
   const [phrase, setPhrase] = useState("");
   const [replacement, setReplacement] = useState("");
@@ -43,7 +43,8 @@ function DictationSettingsForm() {
     }
     if (
       settings.replacements.some(
-        (entry) => entry.phrase !== editing && entry.phrase.toLowerCase() === trigger.toLowerCase(),
+        (entry) =>
+          entry.phrase !== editing?.phrase && entry.phrase.toLowerCase() === trigger.toLowerCase(),
       )
     ) {
       setError("That spoken phrase already has a replacement.");
@@ -54,17 +55,24 @@ function DictationSettingsForm() {
       return;
     }
     const entry = { kind, phrase: trigger, replacement };
-    if (editing !== null && !settings.replacements.some((item) => item.phrase === editing)) {
+    if (
+      editing !== null &&
+      !settings.replacements.some(
+        (item) =>
+          item.phrase === editing.phrase &&
+          item.kind === editing.kind &&
+          item.replacement === editing.replacement,
+      )
+    ) {
       setError("This entry changed on another client. Cancel and open it again.");
       return;
     }
     update({
       dictation: {
-        ...settings,
         replacements:
           editing === null
             ? [...settings.replacements, entry]
-            : settings.replacements.map((old) => (old.phrase === editing ? entry : old)),
+            : settings.replacements.map((old) => (old.phrase === editing.phrase ? entry : old)),
       },
     });
     reset();
@@ -83,9 +91,7 @@ function DictationSettingsForm() {
             <Switch
               aria-label="Polish after dictation"
               checked={settings.autoPolish}
-              onCheckedChange={(checked) =>
-                update({ dictation: { ...settings, autoPolish: checked } })
-              }
+              onCheckedChange={(checked) => update({ dictation: { autoPolish: checked } })}
             />
           }
         />
@@ -98,9 +104,7 @@ function DictationSettingsForm() {
             <Switch
               aria-label="Spoken commands"
               checked={settings.spokenCommands}
-              onCheckedChange={(checked) =>
-                update({ dictation: { ...settings, spokenCommands: checked } })
-              }
+              onCheckedChange={(checked) => update({ dictation: { spokenCommands: checked } })}
             />
           }
         />
@@ -113,9 +117,7 @@ function DictationSettingsForm() {
             <Switch
               aria-label="Remove hesitation sounds"
               checked={settings.removeFillers}
-              onCheckedChange={(checked) =>
-                update({ dictation: { ...settings, removeFillers: checked } })
-              }
+              onCheckedChange={(checked) => update({ dictation: { removeFillers: checked } })}
             />
           }
         />
@@ -145,7 +147,7 @@ function DictationSettingsForm() {
                 size="xs"
                 variant="ghost"
                 onClick={() => {
-                  setEditing(entry.phrase);
+                  setEditing({ ...entry });
                   setKind(entry.kind);
                   setPhrase(entry.phrase);
                   setReplacement(entry.replacement);
@@ -160,7 +162,6 @@ function DictationSettingsForm() {
                 onClick={() => {
                   update({
                     dictation: {
-                      ...settings,
                       replacements: settings.replacements.filter((_, item) => item !== index),
                     },
                   });

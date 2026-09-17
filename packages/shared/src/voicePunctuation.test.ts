@@ -14,7 +14,8 @@ describe("spoken punctuation", () => {
     expect(formatSpokenPunctuation(speech)).toBe(expected);
   });
   it("preserves identifiers, decimals, and ordinary period-of phrasing", () => {
-    const text = "use foo.period and comma_count over a period of time with version 3.14";
+    const text =
+      "use foo.period period.foo foo:comma comma:foo period/foo foo/period comma_count over a period of time with version 3.14";
     expect(formatSpokenPunctuation(text)).toBe(text);
   });
 });

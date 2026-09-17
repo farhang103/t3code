@@ -22,6 +22,8 @@ const fixture = vi.hoisted(() => ({
   formatted: '{"text":"Can you check the microphone, please?"}',
   calls: [] as Array<{ method: string; params: unknown }>,
   launches: [] as unknown[],
+  toolConfig: {} as Record<string, unknown>,
+  toolInventory: { data: [], nextCursor: null } as unknown,
 }));
 
 vi.mock("../provider/Layers/CodexProvider.ts", () => ({
@@ -86,6 +88,9 @@ vi.mock("../provider/Layers/CodexProvider.ts", () => ({
             request: (method: string, params: unknown) =>
               Effect.gen(function* () {
                 fixture.calls.push({ method, params });
+                if (method === "config/read")
+                  return { config: { mcp_servers: fixture.toolConfig } };
+                if (method === "mcpServerStatus/list") return fixture.toolInventory;
                 if (method === "thread/start") {
                   fixture.prepared?.();
                   if (fixture.waitForPrepare) yield* Effect.promise(fixture.waitForPrepare);
@@ -145,7 +150,7 @@ it.effect("uses the selected enabled account and refuses disabled or missing ins
       expect.objectContaining({
         binaryPath: "work-codex",
         homePath: path.resolve("test-work-codex-home"),
-        launchArgs: "--verbose",
+        launchArgs: "--verbose --disable apps --disable plugins",
         environment: expect.objectContaining({ T3_VOICE_ACCOUNT_TEST: "work" }),
       }),
     ]);
@@ -178,10 +183,62 @@ it.effect("uses the selected enabled account and refuses disabled or missing ins
   ),
 );
 beforeEach(() => {
+  fixture.toolConfig = {};
+  fixture.toolInventory = { data: [], nextCursor: null };
   fixture.failClient = false;
   fixture.failPrepare = false;
   fixture.waitForPrepare = null;
 });
+
+it.effect("disables inherited MCP servers and verifies the runtime before polishing", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.calls = [];
+    fixture.toolConfig = { "work.tools": { enabled: true, command: "tool-server" } };
+    fixture.toolInventory = { data: [{ runtimeStatus: "disabled", tools: {} }], nextCursor: null };
+    const sessions = yield* makeCodexVoiceSessions();
+    yield* sessions.polish(instance, "Please check this", "cleanup");
+    expect(fixture.calls.find((call) => call.method === "thread/start")).toMatchObject({
+      params: {
+        dynamicTools: [],
+        selectedCapabilityRoots: [],
+        config: {
+          "features.apps": false,
+          "features.plugins": false,
+          mcp_servers: { "work.tools": { enabled: false, enabled_tools: [] } },
+        },
+      },
+    });
+    expect(fixture.calls.findIndex((call) => call.method === "mcpServerStatus/list")).toBeLessThan(
+      fixture.calls.findIndex((call) => call.method === "turn/start"),
+    );
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("refuses transcripts when tool isolation is missing or ineffective", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    const sessions = yield* makeCodexVoiceSessions();
+    for (const inventory of [
+      { data: [{ runtimeStatus: "connected", tools: {} }], nextCursor: null },
+      { data: [{ runtimeStatus: "disabled", tools: { write: {} } }], nextCursor: null },
+      { data: [{ tools: {} }], nextCursor: null },
+      {},
+    ]) {
+      fixture.calls = [];
+      fixture.toolInventory = inventory;
+      expect(yield* sessions.available("owner", instance)).toBe(false);
+      expect((yield* Effect.result(sessions.polish(instance, "input", "cleanup")))._tag).toBe(
+        "Failure",
+      );
+      expect(
+        fixture.calls.some(
+          (call) => call.method === "turn/start" || call.method === "thread/realtime/start",
+        ),
+      ).toBe(false);
+    }
+  }).pipe(Effect.provide(dependencies)),
+);
 
 it.effect("negotiates a separate ephemeral thread and only its owner can stop it", () =>
   Effect.gen(function* () {
@@ -193,7 +250,7 @@ it.effect("negotiates a separate ephemeral thread and only its owner can stop it
     const result = yield* sessions.start("owner", instance, "offer");
     expect(result.sdp).toBe("answer");
     expect(fixture.closed).toBe(0);
-    expect(fixture.calls[0]).toMatchObject({
+    expect(fixture.calls.find((call) => call.method === "thread/start")).toMatchObject({
       method: "thread/start",
       params: {
         ephemeral: true,

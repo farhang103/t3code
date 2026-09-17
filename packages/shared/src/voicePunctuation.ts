@@ -12,7 +12,7 @@ const punctuation: Record<string, string> = {
 /** Interpret spoken punctuation before inserting speech or requesting cleanup. */
 export function formatSpokenPunctuation(text: string): string {
   return text.replace(
-    /[.,!?]?[ \t]*(?<![\p{L}\p{N}_./-])(question mark|exclamation mark|exclamation point|full stop|period(?!\s+of\b)|comma)(?![\p{L}\p{N}_/-])[.,!?]?/giu,
+    /[.,!?]?[ \t]*(?<![\p{L}\p{N}_./:-])(question mark|exclamation mark|exclamation point|full stop|period(?!\s+of\b)|comma)(?![\p{L}\p{N}_/-]|[.:][\p{L}\p{N}_./:-])[.,!?]?/giu,
     (_match, command: string) => punctuation[command.toLowerCase()] ?? command,
   );
 }

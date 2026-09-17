@@ -253,4 +253,21 @@ describe("live recorder completion", () => {
     await started;
     expect(track.stop).toHaveBeenCalled();
   });
+  it("keeps late microphone tracks muted after a concurrent stop", async () => {
+    const microphone = deferredMicrophone();
+    const { recorder } = createRecorderHarness(microphone.promise);
+    const started = recorder.start();
+    const stopped = recorder.stop();
+    const track = { enabled: true, stop: vi.fn() };
+    microphone.resolve({
+      getTracks: () => [track],
+      getAudioTracks: () => [track],
+    } as unknown as MediaStream);
+    await started;
+    expect(track.enabled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1500);
+    await stopped;
+    expect(track.enabled).toBe(false);
+    recorder.dispose();
+  });
 });

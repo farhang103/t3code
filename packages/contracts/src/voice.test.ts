@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { DictationSettings, VoicePolishRequest } from "./voice.ts";
 import { ServerSettings, ServerSettingsPatch } from "./settings.ts";
 const decodeSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
+const decodeDictationSettings = Schema.decodeUnknownSync(DictationSettings);
 
 describe("dictation preferences and optional edits", () => {
   it.each([
@@ -63,6 +64,20 @@ describe("dictation preferences and optional edits", () => {
         })),
       }),
     ).toThrow();
+  });
+  it.each(["", "   ", "\n\t", "a".repeat(4001)])(
+    "rejects blank or oversized replacements",
+    (replacement) => {
+      const replacements = [{ kind: "snippet", phrase: "my snippet", replacement }];
+      expect(() => decodeDictationSettings({ replacements })).toThrow();
+      expect(() => decodeSettingsPatch({ dictation: { replacements } })).toThrow();
+    },
+  );
+  it("preserves intentional whitespace in nonempty snippets", () => {
+    const replacements = [{ kind: "snippet", phrase: "my snippet", replacement: "\n  code\n" }];
+    expect(decodeSettingsPatch({ dictation: { replacements } })).toEqual({
+      dictation: { replacements },
+    });
   });
   it("requires a bounded text and a supported editing style", () => {
     const decode = Schema.decodeUnknownSync(VoicePolishRequest);

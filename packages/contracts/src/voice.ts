@@ -31,7 +31,11 @@ export const VoicePolishRequest = Schema.Struct({
 export const DictationReplacement = Schema.Struct({
   kind: Schema.Literals(["word", "snippet"]),
   phrase: TrimmedNonEmptyString.check(Schema.isMaxLength(100)),
-  replacement: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4000)),
+  replacement: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(4000),
+    Schema.isPattern(/\S/u),
+  ),
 });
 export type DictationReplacement = typeof DictationReplacement.Type;
 export const DictationSettings = Schema.Struct({

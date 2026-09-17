@@ -167,7 +167,8 @@ export function createCodexVoiceRecorder(
           rejectStart = undefined;
         };
         await Promise.all([negotiate(), attachMicrophone]);
-        if (!disposed && stream) for (const track of stream.getAudioTracks()) track.enabled = true;
+        if (!disposed && !finishing && stream)
+          for (const track of stream.getAudioTracks()) track.enabled = true;
       } catch (error) {
         closeServer();
         throw error;
