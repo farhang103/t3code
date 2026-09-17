@@ -52,12 +52,6 @@ const resolveInstance = Effect.fn("CodexVoice.resolveInstance")(function* (
   return { config, layout, environment: mergeProviderInstanceEnvironment(instance.environment) };
 });
 
-export const codexVoiceAvailable = (instanceId: ProviderInstanceId) =>
-  resolveInstance(instanceId).pipe(
-    Effect.as(true),
-    Effect.catch(() => Effect.succeed(false)),
-  );
-
 const prepareVoice = Effect.fn("CodexVoice.prepare")(function* ({
   config,
   layout,
@@ -169,38 +163,50 @@ export const makeCodexVoiceSessions = Effect.fn("CodexVoice.makeSessions")(funct
     instanceId: ProviderInstanceId,
   ) {
     const resolved = yield* resolveInstance(instanceId);
-    const slot = yield* Effect.gen(function* () {
+    return yield* Effect.gen(function* () {
       const previous = idle.get(owner);
       if (previous?.instanceId === instanceId && previous.fingerprint === fingerprint(resolved)) {
         previous.expiresAt = (yield* Clock.currentTimeMillis) + 120_000;
-        return;
+        return previous;
       }
       if (previous) yield* discardIdle(owner, previous);
-      if (
-        [...sessions.values()].some((session) => session.owner === owner) ||
-        sessions.size + idle.size >= 8
-      )
-        return;
-      const next = yield* createSlot(instanceId, resolved);
-      idle.set(owner, next);
-      return next;
-    }).pipe(lock.withPermit);
-    if (!slot) return;
-    yield* slot.ready.pipe(
-      Effect.catch(() => discardIdle(owner, slot)),
-      Effect.forkIn(serviceScope),
-    );
-    yield* Effect.gen(function* () {
-      while (idle.get(owner) === slot) {
-        const remaining = slot.expiresAt - (yield* Clock.currentTimeMillis);
-        if (remaining <= 0) {
-          yield* discardIdle(owner, slot);
-          return;
-        }
-        yield* Effect.sleep(remaining);
+      const active = [...sessions.values()].find((session) => session.owner === owner);
+      if (active) {
+        return active.instanceId === instanceId && active.slot.fingerprint === fingerprint(resolved)
+          ? active.slot
+          : undefined;
       }
-    }).pipe(Effect.forkIn(serviceScope));
+      if (sessions.size + idle.size >= 8) return;
+      const slot = yield* createSlot(instanceId, resolved);
+      idle.set(owner, slot);
+      yield* slot.ready.pipe(
+        Effect.catch(() => discardIdle(owner, slot)),
+        Effect.forkIn(serviceScope),
+      );
+      yield* Effect.gen(function* () {
+        while (idle.get(owner) === slot) {
+          const remaining = slot.expiresAt - (yield* Clock.currentTimeMillis);
+          if (remaining <= 0) {
+            yield* discardIdle(owner, slot);
+            return;
+          }
+          yield* Effect.sleep(remaining);
+        }
+      }).pipe(Effect.forkIn(serviceScope));
+      return slot;
+    }).pipe(lock.withPermit);
   });
+  const available = Effect.fn("CodexVoice.available")(
+    function* (owner: string, instanceId: ProviderInstanceId) {
+      const slot = yield* warm(owner, instanceId);
+      if (!slot) return false;
+      return yield* slot.ready.pipe(
+        Effect.as(true),
+        Effect.catch(() => discardIdle(owner, slot).pipe(Effect.as(false))),
+      );
+    },
+    Effect.orElseSucceed(() => false),
+  );
   const close = Effect.fn("CodexVoice.close")(function* (id: string) {
     const session = sessions.get(id);
     if (!session) return;
@@ -358,13 +364,14 @@ export const makeCodexVoiceSessions = Effect.fn("CodexVoice.makeSessions")(funct
       polishLock.withPermit,
       Effect.scoped,
       Effect.timeout("30 seconds"),
-      Effect.mapError(
-        () =>
-          new EnvironmentHttpInternalServerError({
-            message: "Could not polish this text. Your draft has not changed. Please try again.",
-          }),
+      Effect.mapError((error) =>
+        error._tag === "EnvironmentHttpBadRequestError" || isForbidden(error)
+          ? error
+          : new EnvironmentHttpInternalServerError({
+              message: "Could not polish this text. Your draft has not changed. Please try again.",
+            }),
       ),
     );
   });
-  return { start, stop, warm, finish, polish };
+  return { start, stop, warm, available, finish, polish };
 });

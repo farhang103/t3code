@@ -78,6 +78,42 @@ const recordProviderUsage = (provider: string, instanceId: string | null = provi
   });
 
 it.layer(NodeServices.layer)("server settings", (it) => {
+  it.effect(
+    "preserves omitted dictation preferences and persists explicit replacement deletion",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const original = {
+          autoPolish: true,
+          spokenCommands: true,
+          removeFillers: false,
+          replacements: [{ kind: "word" as const, phrase: "tea three", replacement: "T3" }],
+        };
+        yield* service.updateSettings({ dictation: original });
+        yield* service.updateSettings(
+          yield* decodeSettingsPatch({ dictation: { spokenCommands: false } }),
+        );
+        const expected = { ...original, spokenCommands: false };
+        assert.deepEqual((yield* service.getSettings).dictation, expected);
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const decodePersisted = Schema.decodeUnknownEffect(Schema.fromJsonString(ServerSettings));
+        assert.deepEqual(
+          (yield* decodePersisted(yield* fs.readFileString(config.settingsPath))).dictation,
+          expected,
+        );
+        yield* service.updateSettings(yield* decodeSettingsPatch({ dictation: {} }));
+        assert.deepEqual((yield* service.getSettings).dictation, expected);
+        yield* service.updateSettings(
+          yield* decodeSettingsPatch({ dictation: { replacements: [] } }),
+        );
+        assert.deepEqual(
+          (yield* decodePersisted(yield* fs.readFileString(config.settingsPath))).dictation,
+          { ...expected, replacements: [] },
+        );
+      }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("persists dictation phrases and supports editing and deleting them", () =>
     Effect.gen(function* () {
       const service = yield* ServerSettingsModule.ServerSettingsService;

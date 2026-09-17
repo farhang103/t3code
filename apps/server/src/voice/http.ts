@@ -6,7 +6,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { annotateEnvironmentRequest, requireEnvironmentScope } from "../auth/http.ts";
-import { codexVoiceAvailable, makeCodexVoiceSessions } from "./CodexVoice.ts";
+import { makeCodexVoiceSessions } from "./CodexVoice.ts";
 
 export const voiceHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -36,8 +36,7 @@ export const voiceHttpApiLayer = HttpApiBuilder.group(
         "availability",
         Effect.fn("environment.voice.availability")(function* (args) {
           const owner = yield* authorize(args.endpoint.name);
-          const available = yield* codexVoiceAvailable(args.payload.instanceId);
-          if (available) yield* sessions.warm(owner, args.payload.instanceId).pipe(Effect.ignore);
+          const available = yield* sessions.available(owner, args.payload.instanceId);
           return { codexVoiceAvailable: available };
         }),
       )

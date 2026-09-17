@@ -6,15 +6,18 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
-import { vi } from "vite-plus/test";
+import { beforeEach, vi } from "vite-plus/test";
 import { layerTest } from "../serverSettings.ts";
-import { codexVoiceAvailable, makeCodexVoiceSessions } from "./CodexVoice.ts";
+import { makeCodexVoiceSessions } from "./CodexVoice.ts";
 
 const fixture = vi.hoisted(() => ({
   accountType: "chatgpt",
   closed: 0,
   prepared: null as null | (() => void),
   failStart: false,
+  failClient: false,
+  failPrepare: false,
+  waitForPrepare: null as null | (() => Promise<void>),
   waitForEdit: null as null | (() => Promise<void>),
   formatted: '{"text":"Can you check the microphone, please?"}',
   calls: [] as Array<{ method: string; params: unknown }>,
@@ -25,6 +28,9 @@ vi.mock("../provider/Layers/CodexProvider.ts", () => ({
   withCodexAppServerClient: (options: unknown) =>
     Effect.gen(function* () {
       fixture.launches.push(options);
+      if (fixture.failClient) {
+        return yield* Effect.fail({ _tag: "ProbeError" as const, message: "CLI not found" });
+      }
       const handlers = new Map<
         string,
         (event: {
@@ -82,6 +88,13 @@ vi.mock("../provider/Layers/CodexProvider.ts", () => ({
                 fixture.calls.push({ method, params });
                 if (method === "thread/start") {
                   fixture.prepared?.();
+                  if (fixture.waitForPrepare) yield* Effect.promise(fixture.waitForPrepare);
+                  if (fixture.failPrepare) {
+                    return yield* Effect.fail({
+                      _tag: "ProbeError" as const,
+                      message: "secret initialization error",
+                    });
+                  }
                   return { thread: { id: "dictation-thread" } };
                 }
                 if (method === "thread/realtime/start") {
@@ -117,7 +130,7 @@ it.effect("uses the selected enabled account and refuses disabled or missing ins
     const sessions = yield* makeCodexVoiceSessions();
     for (const id of ["codex", "missing"]) {
       const rejected = ProviderInstanceId.make(id);
-      expect(yield* codexVoiceAvailable(rejected)).toBe(false);
+      expect(yield* sessions.available("owner", rejected)).toBe(false);
       const result = yield* Effect.result(sessions.start("owner", rejected, "offer"));
       expect(result).toMatchObject({
         _tag: "Failure",
@@ -126,7 +139,7 @@ it.effect("uses the selected enabled account and refuses disabled or missing ins
     }
     expect(fixture.launches).toEqual([]);
     const selected = ProviderInstanceId.make("codex_work");
-    expect(yield* codexVoiceAvailable(selected)).toBe(true);
+    expect(yield* sessions.available("owner", selected)).toBe(true);
     const result = yield* sessions.start("owner", selected, "offer");
     expect(fixture.launches).toEqual([
       expect.objectContaining({
@@ -164,6 +177,11 @@ it.effect("uses the selected enabled account and refuses disabled or missing ins
     ),
   ),
 );
+beforeEach(() => {
+  fixture.failClient = false;
+  fixture.failPrepare = false;
+  fixture.waitForPrepare = null;
+});
 
 it.effect("negotiates a separate ephemeral thread and only its owner can stop it", () =>
   Effect.gen(function* () {
@@ -215,7 +233,133 @@ it.effect("rejects API-key accounts and releases failed sessions for retry", () 
 
 it.effect("reports non-Codex instances unavailable without starting a CLI", () =>
   Effect.gen(function* () {
-    expect(yield* codexVoiceAvailable(ProviderInstanceId.make("claudeAgent"))).toBe(false);
+    fixture.calls = [];
+    const sessions = yield* makeCodexVoiceSessions();
+    expect(yield* sessions.available("owner", ProviderInstanceId.make("claudeAgent"))).toBe(false);
+    expect(fixture.calls).toEqual([]);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("waits for preparation and reuses it for availability and recording", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.failStart = false;
+    fixture.calls = [];
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    fixture.waitForPrepare = () => {
+      entered.resolve();
+      return release.promise;
+    };
+    const sessions = yield* makeCodexVoiceSessions();
+    let reported = false;
+    const checking = yield* sessions.available("owner", instance).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          reported = true;
+        }),
+      ),
+      Effect.forkScoped,
+    );
+    yield* Effect.promise(() => entered.promise);
+    expect(reported).toBe(false);
+    release.resolve();
+    expect(yield* Fiber.join(checking)).toBe(true);
+    expect(yield* sessions.available("owner", instance)).toBe(true);
+    const recording = yield* sessions.start("owner", instance, "offer");
+    expect(yield* sessions.available("owner", instance)).toBe(true);
+    expect(fixture.calls.filter((call) => call.method === "thread/start")).toHaveLength(1);
+    yield* sessions.stop("owner", recording.sessionId);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("reports failed preparation unavailable, releases it, and allows retry", () =>
+  Effect.gen(function* () {
+    fixture.closed = 0;
+    const sessions = yield* makeCodexVoiceSessions();
+    fixture.accountType = "apiKey";
+    expect(yield* sessions.available("owner", instance)).toBe(false);
+    expect(fixture.closed).toBe(1);
+    fixture.accountType = "chatgpt";
+    fixture.failClient = true;
+    expect(yield* sessions.available("owner", instance)).toBe(false);
+    fixture.failClient = false;
+    fixture.failPrepare = true;
+    expect(yield* sessions.available("owner", instance)).toBe(false);
+    expect(fixture.closed).toBe(2);
+    fixture.failPrepare = false;
+    expect(yield* sessions.available("owner", instance)).toBe(true);
+    expect(fixture.closed).toBe(2);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("keeps shared preparation alive when an availability request is cancelled", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.calls = [];
+    fixture.closed = 0;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    fixture.waitForPrepare = () => {
+      entered.resolve();
+      return release.promise;
+    };
+    const sessions = yield* makeCodexVoiceSessions();
+    const checking = yield* sessions.available("owner", instance).pipe(Effect.forkScoped);
+    yield* Effect.promise(() => entered.promise);
+    yield* Fiber.interrupt(checking);
+    expect(fixture.closed).toBe(0);
+    release.resolve();
+    expect(yield* sessions.available("owner", instance)).toBe(true);
+    expect(fixture.calls.filter((call) => call.method === "thread/start")).toHaveLength(1);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("bounds availability checks when preparation hangs", () =>
+  Effect.gen(function* () {
+    fixture.accountType = "chatgpt";
+    fixture.closed = 0;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    fixture.waitForPrepare = () => {
+      entered.resolve();
+      return release.promise;
+    };
+    const sessions = yield* makeCodexVoiceSessions();
+    const checking = yield* sessions.available("owner", instance).pipe(Effect.forkScoped);
+    yield* Effect.promise(() => entered.promise);
+    yield* TestClock.adjust("15 seconds");
+    expect(yield* Fiber.join(checking)).toBe(false);
+    expect(fixture.closed).toBe(1);
+  }).pipe(Effect.provide(dependencies)),
+);
+
+it.effect("preserves provider and authentication errors when polishing", () =>
+  Effect.gen(function* () {
+    const sessions = yield* makeCodexVoiceSessions();
+    expect(
+      yield* Effect.result(sessions.polish(ProviderInstanceId.make("missing"), "draft", "cleanup")),
+    ).toMatchObject({ _tag: "Failure", failure: { _tag: "EnvironmentHttpBadRequestError" } });
+    fixture.accountType = "apiKey";
+    fixture.closed = 0;
+    expect(yield* Effect.result(sessions.polish(instance, "draft", "cleanup"))).toMatchObject({
+      _tag: "Failure",
+      failure: {
+        _tag: "EnvironmentHttpForbiddenError",
+        message: expect.stringContaining("codex login"),
+      },
+    });
+    expect(fixture.closed).toBe(1);
+    fixture.accountType = "chatgpt";
+    fixture.failPrepare = true;
+    expect(yield* Effect.result(sessions.polish(instance, "draft", "cleanup"))).toMatchObject({
+      _tag: "Failure",
+      failure: {
+        _tag: "EnvironmentHttpInternalServerError",
+        message: "Could not polish this text. Your draft has not changed. Please try again.",
+      },
+    });
+    expect(fixture.closed).toBe(2);
   }).pipe(Effect.provide(dependencies)),
 );
 
