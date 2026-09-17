@@ -9,6 +9,7 @@ import { AppTextInput } from "../../../components/AppText";
 export interface AutoSettleDaysFieldProps {
   readonly value: number;
   readonly onValueChange: (value: number) => void;
+  readonly disabled?: boolean;
 }
 
 export function AutoSettleDaysField(props: AutoSettleDaysFieldProps) {
@@ -37,6 +38,7 @@ export function AutoSettleDaysField(props: AutoSettleDaysFieldProps) {
       onBlur={commit}
       onSubmitEditing={commit}
       accessibilityLabel="Days before auto-settle"
+      editable={!props.disabled}
     />
   );
 }
